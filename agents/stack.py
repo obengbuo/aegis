@@ -16,8 +16,9 @@ import os
 from dotenv import load_dotenv
 from pydantic_ai import Agent
 
-from agents.servers import SANDBOX_DIR, fetch, filesystem
+from agents.servers import ACTIVE_SERVERS, SANDBOX_DIR, demo, fetch, filesystem
 from aegis.audit import summary
+from aegis.fingerprint import check_server
 
 load_dotenv()
 
@@ -39,12 +40,45 @@ ops_agent = Agent(
 
 orchestrator = Agent(
     MODEL,
-    toolsets=[filesystem, fetch],
+    toolsets=[filesystem, fetch, demo],
     system_prompt=(
         "You handle tasks that need both web research and file operations. "
         "Research first, then write results to files."
     ),
 )
+
+
+async def _fingerprint_servers() -> None:
+    """List tools on every active server and compare against stored baselines."""
+    print("\n--- Aegis: server fingerprinting ---")
+    for name, toolset in ACTIVE_SERVERS.items():
+        tools = await toolset.list_tools()
+        result = check_server(name, tools)
+        status = result["status"]
+        fp = result.get("fingerprint", {})
+
+        if status == "new":
+            print(
+                f"  [new]     {name:15s}  {fp['tool_count']} tools"
+                f"  hash={fp['surface_hash'][:16]}..."
+            )
+        elif status == "unchanged":
+            print(
+                f"  [ok]      {name:15s}  {fp['tool_count']} tools  unchanged"
+            )
+        elif status == "drift":
+            print(f"  [DRIFT!]  {name:15s}  SUPPLY-CHAIN ALERT")
+            if result["tools_added"]:
+                print(f"            added    : {result['tools_added']}")
+            if result["tools_removed"]:
+                print(f"            removed  : {result['tools_removed']}")
+            if result["tools_modified"]:
+                print(f"            modified : {result['tools_modified']}")
+            print(
+                f"            prev={result['previous_hash'][:16]}..."
+                f"  curr={result['current_hash'][:16]}..."
+            )
+    print()
 
 
 async def main() -> None:
@@ -57,6 +91,8 @@ async def main() -> None:
         print("=" * 60)
         print("AEGIS — multi-agent test stack")
         print("=" * 60)
+
+        await _fingerprint_servers()
 
         r1 = await ops_agent.run(
             "Create a file called notes.txt containing the line 'hello aegis'."

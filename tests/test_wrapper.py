@@ -16,10 +16,13 @@ from aegis import audit, wrapper
 
 
 class FakeCtx:
-    """Stand-in for the Pydantic AI run context."""
+    """Minimal stand-in for pydantic_ai.RunContext.
 
-    def __init__(self, server_name: str) -> None:
-        self.tool_name = server_name
+    The real RunContext carries deps, model, usage, agent, tool_name (the
+    TOOL name, not the server name), etc.  wrapper._process does not read
+    from ctx — server identity comes from the make_process_tool_call closure
+    — so FakeCtx needs no fields.  It exists solely to satisfy the type slot.
+    """
 
 
 @pytest.fixture(autouse=True)
@@ -34,10 +37,10 @@ def test_successful_call_is_logged(temp_log):
     async def fake_call_tool(tool_name, args):
         return {"ok": True, "echo": args}
 
+    hook = wrapper.make_process_tool_call("filesystem")
+
     async def run():
-        return await wrapper.process_tool_call(
-            FakeCtx("filesystem"), fake_call_tool, "read_file", {"path": "/x"}
-        )
+        return await hook(FakeCtx(), fake_call_tool, "read_file", {"path": "/x"})
 
     result = asyncio.run(run())
     assert result == {"ok": True, "echo": {"path": "/x"}}
@@ -54,10 +57,10 @@ def test_failed_call_is_logged_and_reraised(temp_log):
     async def failing_call_tool(tool_name, args):
         raise ValueError("boom")
 
+    hook = wrapper.make_process_tool_call("github")
+
     async def run():
-        return await wrapper.process_tool_call(
-            FakeCtx("github"), failing_call_tool, "create_issue", {}
-        )
+        return await hook(FakeCtx(), failing_call_tool, "create_issue", {})
 
     with pytest.raises(ValueError, match="boom"):
         asyncio.run(run())
@@ -74,10 +77,10 @@ def test_oversized_args_are_truncated(temp_log):
     async def fake_call_tool(tool_name, args):
         return "done"
 
+    hook = wrapper.make_process_tool_call("postgres")
+
     async def run():
-        return await wrapper.process_tool_call(
-            FakeCtx("postgres"), fake_call_tool, "query", {"sql": big_value}
-        )
+        return await hook(FakeCtx(), fake_call_tool, "query", {"sql": big_value})
 
     asyncio.run(run())
     records = [json.loads(line) for line in temp_log.read_text().splitlines()]

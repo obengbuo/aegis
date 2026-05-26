@@ -24,28 +24,51 @@ from aegis.audit import write_record
 from aegis.fingerprint import note_server_seen
 
 
+def make_process_tool_call(server_name: str) -> Callable[..., Awaitable[Any]]:
+    """Return a process_tool_call hook bound to a specific server name.
+
+    Each MCPServerStdio should be created with its own named hook so the
+    audit log records which server each tool call went to.  The hook is
+    a closure that captures server_name at definition time.
+
+    Usage in servers.py:
+        filesystem = MCPServerStdio(..., process_tool_call=make_process_tool_call("filesystem"))
+        fetch      = MCPServerStdio(..., process_tool_call=make_process_tool_call("fetch"))
+    """
+    async def _hook(
+        ctx: Any,
+        call_tool: Callable[..., Awaitable[Any]],
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> Any:
+        return await _process(server_name, ctx, call_tool, tool_name, args)
+
+    return _hook
+
+
 async def process_tool_call(
     ctx: Any,
     call_tool: Callable[..., Awaitable[Any]],
     tool_name: str,
     args: dict[str, Any],
 ) -> Any:
-    """Pydantic AI process_tool_call hook.
-
-    Args:
-        ctx: run context provided by Pydantic AI
-        call_tool: the actual callable that forwards to the MCP server
-        tool_name: the name of the tool being called
-        args: the arguments the agent wants to pass
-
-    Returns:
-        Whatever the MCP server returns (unchanged in Phase 1).
+    """Pydantic AI process_tool_call hook (unnamed fallback — prefer make_process_tool_call).
 
     Phase 1 behavior: log everything, pass through.
     Phase 2 behavior: evaluate policy first; ALLOW / DENY / INTERCEPT.
     """
+    return await _process("unknown-server", ctx, call_tool, tool_name, args)
+
+
+async def _process(
+    server_name: str,
+    ctx: Any,
+    call_tool: Callable[..., Awaitable[Any]],
+    tool_name: str,
+    args: dict[str, Any],
+) -> Any:
+    """Core interception logic shared by the named and unnamed hooks."""
     call_id = str(uuid.uuid4())
-    server_name = getattr(ctx, "tool_name", None) or "unknown-server"
     started = time.monotonic()
 
     base_record = {
