@@ -32,6 +32,7 @@ filesystem = MCPToolset(
         ["-y", "@modelcontextprotocol/server-filesystem", SANDBOX_DIR],
     ),
     process_tool_call=make_process_tool_call("filesystem"),
+    init_timeout=30,
 )
 
 # @modelcontextprotocol/server-fetch was removed from npm; the canonical

@@ -32,8 +32,8 @@ def make_process_tool_call(server_name: str) -> Callable[..., Awaitable[Any]]:
     a closure that captures server_name at definition time.
 
     Usage in servers.py:
-        filesystem = MCPServerStdio(..., process_tool_call=make_process_tool_call("filesystem"))
-        fetch      = MCPServerStdio(..., process_tool_call=make_process_tool_call("fetch"))
+        filesystem = MCPToolset(..., process_tool_call=make_process_tool_call("filesystem"))
+        fetch      = MCPToolset(..., process_tool_call=make_process_tool_call("fetch"))
     """
     async def _hook(
         ctx: Any,

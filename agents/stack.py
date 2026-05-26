@@ -19,6 +19,7 @@ from pydantic_ai import Agent
 from agents.servers import ACTIVE_SERVERS, SANDBOX_DIR, demo, fetch, filesystem
 from aegis.audit import summary
 from aegis.fingerprint import check_server
+from aegis.startup import managed_servers
 
 load_dotenv()
 
@@ -85,32 +86,35 @@ async def main() -> None:
     """Run a few representative tasks across the three agents."""
     os.makedirs(SANDBOX_DIR, exist_ok=True)
 
-    # The orchestrator's context manager starts ALL its MCP servers.
-    # Running agents inside it keeps every server's subprocess alive.
-    async with orchestrator:
-        print("=" * 60)
-        print("AEGIS — multi-agent test stack")
-        print("=" * 60)
+    # managed_servers is the outermost layer: starts each server under Aegis
+    # governance and logs any startup failure to the audit trail before halting.
+    # orchestrator re-enters the same toolsets (MCPToolset nesting is safe —
+    # _running_count means the subprocess only starts and stops once).
+    async with managed_servers(ACTIVE_SERVERS):
+        async with orchestrator:
+            print("=" * 60)
+            print("AEGIS - multi-agent test stack")
+            print("=" * 60)
 
-        await _fingerprint_servers()
+            await _fingerprint_servers()
 
-        r1 = await ops_agent.run(
-            "Create a file called notes.txt containing the line 'hello aegis'."
-        )
-        print(f"\n[ops_agent]      {r1.output}")
+            r1 = await ops_agent.run(
+                "Create a file called notes.txt containing the line 'hello aegis'."
+            )
+            print(f"\n[ops_agent]      {r1.output}")
 
-        r2 = await researcher.run(
-            "In one sentence, what is the Model Context Protocol?"
-        )
-        print(f"\n[researcher]     {r2.output}")
+            r2 = await researcher.run(
+                "In one sentence, what is the Model Context Protocol?"
+            )
+            print(f"\n[researcher]     {r2.output}")
 
-        r3 = await orchestrator.run(
-            "Fetch https://modelcontextprotocol.io and save a one-line "
-            "summary of what the site is about to summary.txt."
-        )
-        print(f"\n[orchestrator]   {r3.output}")
+            r3 = await orchestrator.run(
+                "Fetch https://modelcontextprotocol.io and save a one-line "
+                "summary of what the site is about to summary.txt."
+            )
+            print(f"\n[orchestrator]   {r3.output}")
 
-    # Show what Aegis captured.
+    # Show what Aegis captured (outside managed_servers — servers are stopped).
     print("\n" + "=" * 60)
     print("AEGIS AUDIT SUMMARY")
     print("=" * 60)
