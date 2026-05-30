@@ -56,24 +56,35 @@ def query(
     return results
 
 
+_LIFECYCLE_STATUSES = {"server_init_failed", "server_teardown"}
+
+
 def summary() -> dict[str, Any]:
     """Quick stats over the whole audit log — useful for a CLI dashboard."""
     total = 0
     by_status: dict[str, int] = {}
     by_server: dict[str, int] = {}
     by_tool: dict[str, int] = {}
+    by_lifecycle: dict[str, int] = {}
 
     for rec in read_records():
         total += 1
-        by_status[rec.get("status", "?")] = by_status.get(rec.get("status", "?"), 0) + 1
+        status = rec.get("status", "?")
+        by_status[status] = by_status.get(status, 0) + 1
         by_server[rec.get("server", "?")] = by_server.get(rec.get("server", "?"), 0) + 1
-        by_tool[rec.get("tool", "?")] = by_tool.get(rec.get("tool", "?"), 0) + 1
+
+        if status in _LIFECYCLE_STATUSES:
+            by_lifecycle[status] = by_lifecycle.get(status, 0) + 1
+        else:
+            tool = rec.get("tool", "?")
+            by_tool[tool] = by_tool.get(tool, 0) + 1
 
     return {
         "total_calls": total,
         "by_status": by_status,
         "by_server": by_server,
         "by_tool": by_tool,
+        "by_lifecycle": by_lifecycle,
     }
 
 

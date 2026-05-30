@@ -131,6 +131,7 @@ async def main() -> None:
     print(f"By status               : {stats['by_status']}")
     print(f"By server               : {stats['by_server']}")
     print(f"By tool                 : {stats['by_tool']}")
+    print(f"By lifecycle            : {stats['by_lifecycle']}")
     print("\nFull detail in logs/audit.jsonl")
 
 
