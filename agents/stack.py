@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 
 from dotenv import load_dotenv
 from pydantic_ai import Agent
@@ -90,29 +91,36 @@ async def main() -> None:
     # governance and logs any startup failure to the audit trail before halting.
     # orchestrator re-enters the same toolsets (MCPToolset nesting is safe —
     # _running_count means the subprocess only starts and stops once).
-    async with managed_servers(ACTIVE_SERVERS):
-        async with orchestrator:
-            print("=" * 60)
-            print("AEGIS - multi-agent test stack")
-            print("=" * 60)
+    try:
+        async with managed_servers(ACTIVE_SERVERS):
+            async with orchestrator:
+                print("=" * 60)
+                print("AEGIS - multi-agent test stack")
+                print("=" * 60)
 
-            await _fingerprint_servers()
+                await _fingerprint_servers()
 
-            r1 = await ops_agent.run(
-                "Create a file called notes.txt containing the line 'hello aegis'."
-            )
-            print(f"\n[ops_agent]      {r1.output}")
+                r1 = await ops_agent.run(
+                    "Create a file called notes.txt containing the line 'hello aegis'."
+                )
+                print(f"\n[ops_agent]      {r1.output}")
 
-            r2 = await researcher.run(
-                "In one sentence, what is the Model Context Protocol?"
-            )
-            print(f"\n[researcher]     {r2.output}")
+                r2 = await researcher.run(
+                    "In one sentence, what is the Model Context Protocol?"
+                )
+                print(f"\n[researcher]     {r2.output}")
 
-            r3 = await orchestrator.run(
-                "Fetch https://modelcontextprotocol.io and save a one-line "
-                "summary of what the site is about to summary.txt."
-            )
-            print(f"\n[orchestrator]   {r3.output}")
+                r3 = await orchestrator.run(
+                    "Fetch https://modelcontextprotocol.io and save a one-line "
+                    "summary of what the site is about to summary.txt."
+                )
+                print(f"\n[orchestrator]   {r3.output}")
+
+    except RuntimeError:
+        # managed_servers already printed the formatted status block, logged
+        # server_init_failed to the audit trail, and ran teardown before
+        # raising. Exit cleanly — no traceback needed here.
+        sys.exit(1)
 
     # Show what Aegis captured (outside managed_servers — servers are stopped).
     print("\n" + "=" * 60)
