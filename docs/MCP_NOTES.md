@@ -176,3 +176,41 @@ code, not from the model.
 - HiddenLayer + Trail of Bits — MCP attack research
 - Descope blog — agentic identity / MCP auth series
 - Knostic + Backslash Security — the MCP server scan disclosures
+
+
+## Deferred hardening items (pre-customer-install checklist)
+
+These are known defense-in-depth gaps that don't matter for the current threat
+model (solo developer running Aegis against agents) but should be closed before
+shipping to a design partner where a less-trusted operator might supply config.
+
+### Sandbox-root injection defense in `aegis/proposer.py`
+
+**Current state:** `sandbox_root` is interpolated into the system prompt via
+f-string:
+
+```python
+system = f"sandbox_root: {sandbox_root}\n\n{SYSTEM_PROMPT}"
+```
+
+**Gap:** if `sandbox_root` contains newlines or control characters (e.g., if
+loaded from a config file edited by a less-trusted party), those characters
+flow unescaped into the system message and could change its structure.
+
+**Fix when needed:** wrap `sandbox_root` in `repr()` so the model sees a quoted
+string:
+
+```python
+system = f"sandbox_root: {str(sandbox_root)!r}\n\n{SYSTEM_PROMPT}"
+```
+
+Add a test that asserts a `sandbox_root` containing `\n` does not produce a
+multi-line system message at the API call site (monkeypatch to capture the
+system string).
+
+**Trigger:** before first design-partner install where the operator supplies
+config from an untrusted source.
+
+**Threat-model note:** outside the current customer threat model (operator is
+the same person running Aegis). Becomes relevant when operator config can be
+edited by a different party than the one running enforcement.
