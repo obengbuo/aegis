@@ -56,7 +56,7 @@ def query(
     return results
 
 
-_LIFECYCLE_STATUSES = {"server_init_failed", "server_teardown"}
+_LIFECYCLE_STATUSES = {"server_init_failed", "server_teardown", "spec_loaded"}
 
 
 def summary() -> dict[str, Any]:

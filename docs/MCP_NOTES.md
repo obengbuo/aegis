@@ -98,6 +98,75 @@ Aegis integrates with this layer; it does not replace it.
 
 ---
 
+## Enforcement architecture — deterministic capability scoping
+
+### The principle
+
+**Aegis's enforcement path contains no LLM.** The LLM may propose a capability
+spec once, before execution begins, on trusted user-supplied input. After that,
+every tool call is evaluated by deterministic code against a static spec. No
+LLM-as-judge, no intent classification at runtime, no mid-run renegotiation.
+
+This is non-negotiable for the enforcement path. If you find yourself adding an
+LLM call inside `evaluate()` or inside the wrapper's DENY/ALLOW branch, stop
+and flag it explicitly for review. Do not quietly add it.
+
+### The bootstrap problem
+
+An LLM-based inspector inherits the instability of the thing being inspected.
+
+The attack scenario: an agent reads a file containing injected instructions. If
+an LLM then decides whether to allow or deny the follow-on tool call, that LLM
+is reasoning from a context that is already contaminated — the injected
+instructions are in the same prompt window. A sufficiently crafted injection can
+cause the "inspector" LLM to conclude that the out-of-scope call is acceptable.
+The inspector and the executor share the same prompt; you cannot inspect a
+corrupted prompt with a prompt.
+
+The solution: narrow the executor, don't broaden the inspector. Define the
+permitted capability surface before execution begins, on input the attacker has
+not yet touched (the user's task description). Lock that surface into a static
+data structure. Evaluate every subsequent tool call against the static surface
+using code that has no opinion about intent — only about whether the (server,
+tool, args) triple matches the spec. Code has no prompt window to inject.
+
+### Capability-based security precedent
+
+This architecture is an instance of capability-based security, a lineage that
+runs through the E programming language (Mark S. Miller, 1997) and the KeyKOS
+operating system (Bomberger et al., 1980s–1990s). The core idea: a principal
+has authority to perform exactly the actions for which it holds an explicit,
+unforgeable capability — not because it claims a role, and not because an
+authority decides at runtime that its intent appears good.
+
+In E and KeyKOS, capabilities were first-class objects passed at object
+construction time. The Aegis analogue: the capability spec is passed into
+`make_process_tool_call()` as a closure argument before the agent run begins.
+The agent inherits the spec at construction time; it cannot modify the spec
+mid-run; it observes the outcome (ALLOW or PermissionError) but cannot appeal
+or renegotiate.
+
+Why this matters specifically for AI agents: agents are powerful but
+unverifiable. You cannot inspect an LLM's internal reasoning and be certain it
+will not follow an injected instruction. Capability scoping sidesteps this
+problem entirely — you do not need to verify the agent's intent; you constrain
+what it can do regardless of intent. The enforcement guarantee comes from the
+code, not from the model.
+
+### Implementation contract
+
+- `aegis/policy.py::evaluate(spec, server, tool, args) -> Decision` is
+  synchronous, pure, no I/O, no imports from any LLM library.
+- `aegis/wrapper.py::_process()` calls `evaluate()` before `call_tool()`.
+  The verdict is final. No retry logic, no LLM interpretation of the denial.
+- A DENY is a first-class audit event with `status: "denied"`, `reason`, and
+  `matched_rule` fields. The denial itself is governance-relevant.
+- If spec loading fails (malformed YAML, schema validation error), the run is
+  aborted before any tool calls happen. A malformed spec means DENY-all, never
+  ALLOW-all. Fail closed.
+
+---
+
 ## Reading list
 
 - modelcontextprotocol.io/specification — the full spec

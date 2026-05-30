@@ -8,6 +8,7 @@ dependencies = [
     "anthropic>=0.40.0",
     "python-dotenv>=1.0.0",
     "psutil>=5.9",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +21,9 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: real network/model calls — excluded from fast unit-test runs",
+]
 
 [tool.ruff]
 line-length = 100

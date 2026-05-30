@@ -5,8 +5,7 @@ THIS IS THE HEART OF THE PRODUCT.
 
 Pydantic AI fires `process_tool_call` for every tool call before it reaches
 the MCP server. In Phase 1 this hook logs the call and returns the result
-unchanged. In Phase 2 the same hook will evaluate policy and may block,
-modify, or pause the call.
+unchanged. In Phase 2 the same hook evaluates policy and may block the call.
 
 Every MCP server wired into any agent MUST pass:
     process_tool_call=process_tool_call
@@ -22,18 +21,21 @@ from typing import Any, Callable, Awaitable
 
 from aegis.audit import write_record
 from aegis.fingerprint import note_server_seen
+from aegis.policy import CapabilitySpec, evaluate
 
 
-def make_process_tool_call(server_name: str) -> Callable[..., Awaitable[Any]]:
+def make_process_tool_call(
+    server_name: str,
+    spec: CapabilitySpec | None = None,
+) -> Callable[..., Awaitable[Any]]:
     """Return a process_tool_call hook bound to a specific server name.
 
-    Each MCPServerStdio should be created with its own named hook so the
-    audit log records which server each tool call went to.  The hook is
-    a closure that captures server_name at definition time.
+    Pass spec to enable enforcement; omit (or pass None) for Phase 1 log-only
+    behavior. Existing callsites that pass only server_name are unaffected.
 
     Usage in servers.py:
         filesystem = MCPToolset(..., process_tool_call=make_process_tool_call("filesystem"))
-        fetch      = MCPToolset(..., process_tool_call=make_process_tool_call("fetch"))
+        fetch      = MCPToolset(..., process_tool_call=make_process_tool_call("fetch", spec=spec))
     """
     async def _hook(
         ctx: Any,
@@ -41,7 +43,7 @@ def make_process_tool_call(server_name: str) -> Callable[..., Awaitable[Any]]:
         tool_name: str,
         args: dict[str, Any],
     ) -> Any:
-        return await _process(server_name, ctx, call_tool, tool_name, args)
+        return await _process(server_name, spec, ctx, call_tool, tool_name, args)
 
     return _hook
 
@@ -54,14 +56,14 @@ async def process_tool_call(
 ) -> Any:
     """Pydantic AI process_tool_call hook (unnamed fallback — prefer make_process_tool_call).
 
-    Phase 1 behavior: log everything, pass through.
-    Phase 2 behavior: evaluate policy first; ALLOW / DENY / INTERCEPT.
+    No spec → Phase 1 log-only behavior.
     """
-    return await _process("unknown-server", ctx, call_tool, tool_name, args)
+    return await _process("unknown-server", None, ctx, call_tool, tool_name, args)
 
 
 async def _process(
     server_name: str,
+    spec: CapabilitySpec | None,
     ctx: Any,
     call_tool: Callable[..., Awaitable[Any]],
     tool_name: str,
@@ -71,7 +73,7 @@ async def _process(
     call_id = str(uuid.uuid4())
     started = time.monotonic()
 
-    base_record = {
+    base_record: dict[str, Any] = {
         "call_id": call_id,
         "ts": datetime.now(timezone.utc).isoformat(),
         "server": server_name,
@@ -82,12 +84,29 @@ async def _process(
     # Phase 1: note that we've seen this server (feeds fingerprinting)
     note_server_seen(server_name)
 
-    # -------------------------------------------------------------------
-    # PHASE 2 INSERTION POINT:
-    #   decision = evaluate_policy(server_name, tool_name, args)
-    #   if decision == "DENY":   write_record({**base_record, "status": "denied"}); raise PermissionError(...)
-    #   if decision == "INTERCEPT": await await_human_approval(call_id)
-    # -------------------------------------------------------------------
+    # Phase 2: policy enforcement — skipped when no spec is provided
+    if spec is not None:
+        try:
+            decision = evaluate(spec, server_name, tool_name, args)
+        except Exception as exc:  # noqa: BLE001 — fail closed
+            write_record({
+                **base_record,
+                "status": "policy_evaluation_error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "spec_hash": spec.spec_hash,
+            })
+            raise PermissionError("policy evaluation failed") from exc
+
+        if decision.verdict == "DENY":
+            write_record({
+                **base_record,
+                "status": "denied",
+                "reason": decision.reason,
+                "matched_rule": decision.matched_rule,
+                "spec_hash": spec.spec_hash,
+            })
+            raise PermissionError(decision.reason)
+        # ALLOW falls through to the call below
 
     try:
         result = await call_tool(tool_name, args)
