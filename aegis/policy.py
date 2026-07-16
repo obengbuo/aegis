@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from aegis.audit import write_record
 
@@ -70,12 +70,28 @@ class ServerSpec(BaseModel):
     tools: dict[str, ToolSpec | None]
 
 
+class InterceptRule(BaseModel):
+    """One (server, tool) pair that requires operator approval before it can
+    proceed, even when the capability rules (1-8) would otherwise ALLOW it.
+
+    Exact match only — same literal-only philosophy as must_match_one_of.
+    This is operator policy, not proposer judgment: propose_spec() never
+    emits this field. See aegis/proposer_prompts.py.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    server: str
+    tool: str
+
+
 class CapabilitySpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     task: str
     deny_all_others: bool = True
     servers: dict[str, ServerSpec]
+    intercepts: list[InterceptRule] = Field(default_factory=list)
     spec_hash: str = ""  # set by load_spec(); not present in YAML
 
     @model_validator(mode="after")
@@ -97,9 +113,33 @@ class CapabilitySpec(BaseModel):
 
 @dataclass(frozen=True)
 class Decision:
-    verdict: Literal["ALLOW", "DENY"]
+    verdict: Literal["ALLOW", "DENY", "INTERCEPT"]
     reason: str
     matched_rule: str | None
+
+
+class AegisApprovalRequired(Exception):
+    """Raised when a call is INTERCEPTed and no approval_callback is configured.
+
+    Carries everything an integrator needs to build their own approval flow:
+    which call was intercepted, its arguments, and the Decision that
+    triggered the intercept (matched_rule is always "rule-9-intercept-required"
+    here, since that's the only rule that produces an INTERCEPT verdict).
+
+    The tool call's arguments are exposed as call_args, not args: Exception
+    already owns .args (the tuple passed to Exception.__init__, used by its
+    default __str__/__repr__) — assigning a dict to self.args here would be
+    silently overwritten by super().__init__() below, and reordering the two
+    assignments would instead silently break str(exc)/repr(exc). call_args
+    avoids the collision entirely.
+    """
+
+    def __init__(self, server: str, tool: str, args: dict[str, Any], decision: Decision) -> None:
+        self.server = server
+        self.tool = tool
+        self.call_args = args
+        self.decision = decision
+        super().__init__(f"Aegis intercepted {server}.{tool} — operator approval required")
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +157,35 @@ def evaluate(
 
     Pure and synchronous. No I/O, no network, no LLM. Returns a Decision.
     The enforcement path contains no LLM; see MCP_NOTES.md for the reasoning.
+
+    Two layers: rules 1-8 (_evaluate_capability_rules) decide ALLOW/DENY.
+    Intercepts are then overlaid on top of that result — they can only
+    downgrade an ALLOW to INTERCEPT, never rescue a DENY. See "Precedence
+    rules" in docs/CAPABILITY_SPEC.md's Intercepts section.
+    """
+    decision = _evaluate_capability_rules(spec, server, tool, args)
+    if decision.verdict != "ALLOW":
+        return decision
+
+    for rule in spec.intercepts:
+        if rule.server == server and rule.tool == tool:
+            return Decision(
+                verdict="INTERCEPT",
+                reason=f"call to '{server}.{tool}' requires operator approval per capability spec",
+                matched_rule="rule-9-intercept-required",
+            )
+
+    return decision
+
+
+def _evaluate_capability_rules(
+    spec: CapabilitySpec,
+    server: str,
+    tool: str,
+    args: dict[str, Any],
+) -> Decision:
+    """Rules 1-8 — the ALLOW/DENY capability engine, unchanged by Stream 4.
+    evaluate() overlays intercepts on top of whatever this returns.
     """
     # Rule 1: server not in spec
     if server not in spec.servers:

@@ -81,6 +81,17 @@ _USER_REQUEST = (
 )
 
 
+# This test hits a real Anthropic model and a real MCP server. Two flake
+# modes have been observed in practice (Week 5 Stream 4/5 review runs):
+# the model returning a transient 529 "Overloaded" (surfaces as
+# ModelHTTPError from pydantic-ai) and, separately, the model simply not
+# taking the injection bait on a given run. Only the former is
+# infrastructure noise worth auto-retrying; the latter is a real assertion
+# failure and should still fail loudly. only_rerun scopes reruns to the
+# infrastructure-flake exception types so Waxell's CI doesn't inherit
+# Anthropic capacity blips as apparent Aegis test failures, without masking
+# a genuine enforcement regression.
+@pytest.mark.flaky(reruns=3, reruns_delay=2, only_rerun=["ModelHTTPError", "OverloadedError", "APIConnectionError"])
 @pytest.mark.integration
 async def test_capability_spec_blocks_injection(tmp_path, monkeypatch):
     """Capability spec (proposer-generated) deterministically blocks the Week 1

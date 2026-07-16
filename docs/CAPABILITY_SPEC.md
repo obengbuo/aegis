@@ -105,7 +105,7 @@ An argument is present in both the call and the spec, and the spec has
 
 ### Decision fields contract
 
-- `verdict`: `"ALLOW"` or `"DENY"`.
+- `verdict`: `"ALLOW"`, `"DENY"`, or `"INTERCEPT"` (Week 5 — see "Intercepts" below).
 - `reason`: always a non-empty string.
   - **On ALLOW, `reason` is always the fixed string `"all checks passed"`.** A
     fixed string makes ALLOW decisions cheaply comparable in logs without parsing.
@@ -113,6 +113,8 @@ An argument is present in both the call and the spec, and the spec has
     Attacker-controlled values (arg names from the call, arg values from the call)
     are `repr()`-escaped before interpolation, so they cannot inject newlines or
     other control characters into the reason string or the JSON audit record.
+  - On INTERCEPT, `reason` names the (server, tool) pair that triggered the
+    intercept rule.
 - `matched_rule`: identifies which rule fired.
   - On DENY: a stable kebab-case string, e.g. `"rule-6-extra-arg"`.
   - On a normal ALLOW (all rules passed): `None`.
@@ -120,6 +122,7 @@ An argument is present in both the call and the spec, and the spec has
     false`): `"rule-1-bypassed-weak-posture"` or `"rule-2-bypassed-weak-posture"`.
     A non-`None` value here makes these bypass events greppable in the audit log,
     distinct from enforcement-passed ALLOWs that earned their `None`.
+  - On INTERCEPT: `"rule-9-intercept-required"`.
 
 ### Rule 5 / Rule 6 ordering rationale
 
@@ -414,6 +417,109 @@ The spec enforces least privilege at the task level, not just the server level.
 
 ---
 
+## Intercepts (Week 5) — pausing for human approval
+
+`ALLOW` / `DENY` is a binary: the call either proceeds or it doesn't, with no
+human in the loop. `intercepts` adds a third verdict, `INTERCEPT`, for calls
+that are within the spec's allowed scope but sensitive enough that an
+operator wants a human sign-off before they proceed — e.g. a delete, a write
+to a shared location, an outbound network call to a new host.
+
+### Format
+
+A top-level `intercepts` list of exact `(server, tool)` pairs, sibling to
+`servers:`, not nested inside it:
+
+```yaml
+task: "example task"
+deny_all_others: true
+servers: {...}
+intercepts:
+  - server: filesystem
+    tool: write_file
+  - server: filesystem
+    tool: delete_file
+```
+
+Exact matches only — no wildcards, no globs — same literal-only philosophy
+as `must_match_one_of`. Omitting `intercepts` entirely defaults to an empty
+list: nothing is intercepted.
+
+### Precedence rules
+
+Intercepts are evaluated as a second pass, strictly after rules 1-8 decide
+ALLOW or DENY:
+
+1. If rules 1-8 would **DENY** the call → verdict stays **DENY**. Intercept
+   never rescues a denied call — a call that shouldn't happen at all doesn't
+   get a chance to be approved into happening.
+2. If rules 1-8 would **ALLOW** the call, and the `(server, tool)` pair
+   matches an entry in `intercepts` → verdict becomes **INTERCEPT**.
+3. If rules 1-8 would **ALLOW** the call, and no `intercepts` entry matches
+   → verdict stays **ALLOW**.
+
+In short: intercepts can only narrow an `ALLOW` into a paused `INTERCEPT`.
+They can never widen a `DENY` into anything else. This is why the check
+happens after, not instead of, rules 1-8 — an intercept rule is not a
+capability grant, it's an extra gate on top of one that already exists.
+
+### Who sets intercepts
+
+`intercepts` is operator policy, not proposer output. `propose_spec()` never
+emits this field — deciding which calls need a human sign-off is a
+risk/business judgment the operator makes when reviewing a proposed spec,
+not something inferable from a task description. See the "INTERCEPTS ARE
+OPERATOR POLICY" section of `aegis/proposer_prompts.py`'s system prompt.
+
+### Runtime behavior
+
+When `evaluate()` returns `INTERCEPT`, `aegis/wrapper.py` writes an audit
+record with `status: "intercepted"` and `matched_rule:
+"rule-9-intercept-required"`, then:
+
+- If `AegisConfig.approval_callback` is set, it's called synchronously as
+  `callback(server, tool, args, decision) -> bool`. `True` lets the call
+  proceed — a follow-up audit record is written with `status: "ok"` and
+  `intercepted: true`, so an investigator can tell "approved after
+  intercept" apart from a call that was allowed outright. `False` blocks the
+  call: a `status: "denied_after_intercept"` record is written
+  (`matched_rule: "rule-9-intercept-denied-by-operator"`) and a
+  `PermissionError` is raised.
+- If no `approval_callback` is configured, `AegisApprovalRequired(server,
+  tool, args, decision)` is raised instead — carrying everything needed to
+  build an out-of-band approval flow (the args are on `.call_args`, not
+  `.args` — `Exception` already owns `.args` for its default string
+  representation).
+
+### Worked example
+
+```yaml
+task: "clean up stale exports in the reports directory"
+deny_all_others: true
+
+servers:
+  filesystem:
+    tools:
+      list_directory:
+        args:
+          path: ~
+      delete_file:
+        args:
+          path: ~
+
+intercepts:
+  - server: filesystem
+    tool: delete_file
+```
+
+The agent can freely list the directory. Every `delete_file` call is within
+scope (any path is allowed by the args block) but is `INTERCEPT`ed — the
+operator sees exactly which file the agent wants to delete and approves or
+declines each one individually, rather than trusting the spec's args block
+alone to make deletion safe.
+
+---
+
 ## Design decisions and rationale
 
 ### Rule 6 — why unlisted args are DENY, not pass-through
@@ -472,6 +578,4 @@ and fall through to ALLOW.
   string or `count` is an integer. Type enforcement happens at the MCP server.
 - **Cross-call constraints** — "read X before writing Y." The spec evaluates
   each call independently. Sequence constraints are Phase 2+.
-- **INTERCEPT decision** — the ALLOW / DENY binary is v1. A third verdict
-  (pause and ask a human) is Week 5.
 - **Scope inheritance / role hierarchies** — one flat spec per run. No nesting.

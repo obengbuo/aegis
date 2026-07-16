@@ -39,11 +39,18 @@ def temp_log(tmp_path, monkeypatch):
     return test_log
 
 
-def _spec(servers: dict, *, task: str = "test task", deny_all_others: bool = True) -> CapabilitySpec:
+def _spec(
+    servers: dict,
+    *,
+    task: str = "test task",
+    deny_all_others: bool = True,
+    intercepts: list | None = None,
+) -> CapabilitySpec:
     """Build a CapabilitySpec from a raw dict — mirrors what YAML loading produces."""
-    return CapabilitySpec.model_validate(
-        {"task": task, "deny_all_others": deny_all_others, "servers": servers}
-    )
+    data = {"task": task, "deny_all_others": deny_all_others, "servers": servers}
+    if intercepts is not None:
+        data["intercepts"] = intercepts
+    return CapabilitySpec.model_validate(data)
 
 
 def _constrained_spec() -> CapabilitySpec:
@@ -477,6 +484,66 @@ def test_repr_defense_against_unicode_line_separators():
 
 
 # ---------------------------------------------------------------------------
+# Intercepts (Week 5 Stream 4) — INTERCEPT verdict and its precedence rules
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_returns_intercept_when_matching_rule():
+    """A call that would ALLOW under rules 1-8, but matches an intercept rule,
+    is downgraded to INTERCEPT — not ALLOW, not DENY."""
+    spec = _spec(
+        {
+            "filesystem": {
+                "tools": {
+                    "write_file": {
+                        "args": {
+                            "path": {"must_match_one_of": ["/sandbox/out.txt"]},
+                            "content": None,
+                        }
+                    }
+                }
+            }
+        },
+        intercepts=[{"server": "filesystem", "tool": "write_file"}],
+    )
+    d = evaluate(spec, "filesystem", "write_file", {"path": "/sandbox/out.txt", "content": "x"})
+    assert d.verdict == "INTERCEPT"
+    assert d.matched_rule == "rule-9-intercept-required"
+    assert "filesystem" in d.reason and "write_file" in d.reason
+
+
+def test_intercept_does_not_override_deny():
+    """An intercept rule on a (server, tool) pair that isn't even in servers:
+    must not rescue the call into INTERCEPT — it's still DENY (rule-2)."""
+    spec = _spec(
+        {"filesystem": {"tools": {"read_text_file": None}}},
+        intercepts=[{"server": "filesystem", "tool": "write_file"}],
+    )
+    d = evaluate(spec, "filesystem", "write_file", {"path": "/x", "content": "y"})
+    assert d.verdict == "DENY"
+    assert d.matched_rule == "rule-2-tool-not-listed"
+
+
+def test_intercept_only_matches_exact_server_and_tool():
+    """An intercept on (filesystem, write_file) must not affect an unrelated,
+    otherwise-allowed call to (filesystem, read_file)."""
+    spec = _spec(
+        {
+            "filesystem": {
+                "tools": {
+                    "read_text_file": {
+                        "args": {"path": {"must_match_one_of": ["/sandbox/notes.txt"]}},
+                    }
+                }
+            }
+        },
+        intercepts=[{"server": "filesystem", "tool": "write_file"}],
+    )
+    d = evaluate(spec, "filesystem", "read_text_file", {"path": "/sandbox/notes.txt"})
+    _assert_allow(d)
+
+
+# ---------------------------------------------------------------------------
 # load_spec — valid spec
 # ---------------------------------------------------------------------------
 
@@ -566,6 +633,41 @@ def test_load_spec_deny_all_others_defaults_to_true(tmp_path):
     })
     spec = load_spec(f)
     assert spec.deny_all_others is True
+
+
+def test_load_spec_parses_intercepts_field(tmp_path):
+    f = tmp_path / "spec.yaml"
+    _write_yaml(f, {
+        "task": "write and delete under supervision",
+        "servers": {
+            "filesystem": {
+                "tools": {
+                    "write_file": {"args": {"path": None, "content": None}},
+                    "delete_file": {"args": {"path": None}},
+                }
+            }
+        },
+        "intercepts": [
+            {"server": "filesystem", "tool": "write_file"},
+            {"server": "filesystem", "tool": "delete_file"},
+        ],
+    })
+    spec = load_spec(f)
+    assert len(spec.intercepts) == 2
+    assert {(r.server, r.tool) for r in spec.intercepts} == {
+        ("filesystem", "write_file"),
+        ("filesystem", "delete_file"),
+    }
+
+
+def test_load_spec_intercepts_empty_by_default(tmp_path):
+    f = tmp_path / "spec.yaml"
+    _write_yaml(f, {
+        "task": "no intercepts key",
+        "servers": {"filesystem": {"tools": {"read_text_file": None}}},
+    })
+    spec = load_spec(f)
+    assert spec.intercepts == []
 
 
 # ---------------------------------------------------------------------------
