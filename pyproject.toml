@@ -3,7 +3,7 @@ name = "aegis"
 version = "0.1.0"
 description = "Runtime governance layer for AI agents. Deterministic capability enforcement, no LLM in the enforcement path, forensic audit trail"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [
     { name = "Stone / Obeng Buo" },
 ]
@@ -46,6 +46,14 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.setuptools.packages.find]
+# aegis/ is the installable product. agents/, tests/, tools/ are repo
+# scaffolding (the test stack, test suite, demo scripts) — not part of the
+# package Waxell installs. Without this, setuptools' flat-layout
+# auto-discovery finds aegis AND agents as top-level packages and refuses
+# to build at all.
+include = ["aegis*"]
 
 [build-system]
 requires = ["setuptools>=68"]
