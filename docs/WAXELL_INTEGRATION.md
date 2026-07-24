@@ -104,6 +104,8 @@ raises a `PermissionError`, and the audit log records
 
 ## Five-minute integration
 
+
+
 ```python
 from pathlib import Path
 from aegis import wrap_toolset, AegisConfig

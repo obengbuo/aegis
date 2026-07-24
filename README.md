@@ -1,90 +1,108 @@
 # Aegis
 
-**Runtime security and governance for the Model Context Protocol (MCP).**
+**Runtime security for AI agents that use the Model Context Protocol.**
 
-Aegis sits between AI agents and the MCP servers they call. Every tool call
-flows through Aegis, which logs it, fingerprints the server, and (Phase 2)
-enforces policy and detects threats.
+Aegis is a deterministic enforcement layer that sits between AI agents and
+the MCP servers they call. It converts natural-language requests into
+capability specs, enforces those specs at the tool-call layer with no LLM
+in the enforcement path, and produces a forensic audit trail for every
+decision.
 
-> AWS secures its own MCP server with IAM. Okta and Descope secure agent
-> identity. Aegis secures every *other* MCP server your agents touch —
-> runtime threat detection and governance across your whole MCP estate.
+**Status:** v0.1.1 — pre-production, actively developed with a design partner.
+
+---
+
+## Install
+
+\`\`\`bash
+pip install git+https://github.com/obengbuo/aegis.git@v0.1.1
+\`\`\`
+
+Requires Python 3.10+.
 
 ---
 
 ## Quick start
 
-```bash
-# 1. Python environment
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+See [docs/WAXELL_INTEGRATION.md](docs/WAXELL_INTEGRATION.md) for a complete
+runnable example and integration reference.
 
-# 2. Node (needed — MCP servers ship as npx packages)
-node --version            # need v18+
-
-# 3. Configure
-cp .env.example .env      # then add your ANTHROPIC_API_KEY
-
-# 4. Run the multi-agent test stack
-python -m agents.stack
-
-# 5. See what Aegis captured
-cat logs/audit.jsonl
-python -m aegis.audit     # prints a summary
-
-# 6. Run the prompt-injection test (the important one)
-python -m tests.test_injection
-
-# 7. Run unit tests
-pytest
-```
+The five-line version: wrap any Pydantic AI `MCPToolset` with `wrap_toolset()`,
+pass a capability spec (natural language via `propose_spec()` or hand-written
+YAML via `load_spec()`), and every tool call runs through Aegis's deterministic
+policy engine before reaching the MCP server.
 
 ---
 
-## What's in here
+## What Aegis does
 
-```
-aegis/          THE PRODUCT
-  wrapper.py      interception hook — every tool call passes through here
-  audit.py        audit log: write / read / query
-  fingerprint.py  MCP server fingerprinting (supply-chain integrity)
+- Wraps existing Pydantic AI `MCPToolset` instances with one line of code
+- Converts natural-language requests to YAML capability specs via LLM (upfront, on trusted input)
+- Enforces those specs at the tool-call layer with pure deterministic Python — no LLM in the enforcement path
+- Provides INTERCEPT verdicts for operator-configured approval workflows
+- Scans tool responses for leaked secrets (SSNs, credit cards, private keys, cloud credentials)
+- Emits audit records with `run_id`, `spec_hash`, and `proposer_prompt_hash` for forensic correlation
+- Exports audit events as OTLP spans for observability pipelines (Datadog, Jaeger, Splunk)
+- Fingerprints MCP servers to detect supply-chain drift
 
-agents/         test agents that exercise the product
-  servers.py      the 5 MCP server definitions
-  stack.py        3 agents x multiple MCP servers
-
-tests/
-  test_wrapper.py    unit tests for the interception layer
-  test_injection.py  the prompt-injection harness
-
-docs/
-  BUILD_PLAN.md   the 90-day plan
-  MCP_NOTES.md    domain notes on MCP security
-
-CLAUDE.md       context for Claude Code — read it first
-```
+Aegis is not a firewall for LLM output. It's a capability system for agent
+tool use, downstream of identity, upstream of the MCP servers themselves.
 
 ---
 
-## The five MCP servers
+## Architectural commitment
 
-| Server      | Credentials | Security risk class it represents      |
-|-------------|-------------|------------------------------------------|
-| filesystem  | none        | path traversal, arbitrary file access    |
-| fetch       | none        | SSRF, exfiltration, web prompt injection  |
-| github      | PAT         | credential scope abuse, secret access     |
-| postgres    | conn string | SQL injection, bulk extraction            |
-| brave       | API key     | untrusted external content                |
+**Aegis's enforcement path contains no LLM.**
 
-Start with **filesystem** and **fetch** — they need no credentials and run
-immediately. Add the others as you populate `.env`.
+An LLM proposes a capability spec once, on the trusted user request, before
+agent execution begins. From that point forward, every tool call is
+evaluated by pure deterministic code against a static spec. The LLM never
+sees tool output. The spec never widens mid-run. Enforcement decisions are
+computed in microseconds and are provable by inspection.
+
+This is the load-bearing design decision. See `docs/CAPABILITY_SPEC.md` for
+the full spec format and evaluation rules.
 
 ---
 
-## Current phase
+## Position in the stack
 
-**Phase 1 (Days 1–30): Learn & Instrument.** Build the multi-agent stack,
-the logging wrapper, fingerprinting, and the injection harness. Do NOT build
-the policy engine, FastAPI control plane, or dashboard yet — that's Phase 2.
+Identity vendors (Okta, Auth0, Descope) prove *who* an agent is. Aegis
+enforces *what* it's allowed to do once it's in.
 
-See `docs/BUILD_PLAN.md` for the full 90-day arc.
+Aegis sits one layer downstream of identity, at the runtime enforcement
+boundary between agents and the MCP servers they call. It works with any
+identity system, any observability stack, and any Pydantic AI-based agent
+runtime.
+
+---
+
+## Repository layout
+
+\`\`\`
+aegis/               The library. This is what pip installs.
+  wrapper.py           Tool-call interception + closure-based policy hook
+  policy.py            Deterministic capability evaluator
+  proposer.py          LLM-based spec proposer (runs once, upfront)
+  audit.py             Structured audit log with OTLP export
+  fingerprint.py       MCP server supply-chain integrity
+  config.py            AegisConfig public API surface
+  response_inspection.py    Deterministic response scanning
+
+docs/                User-facing documentation
+tests/               95 unit + integration tests
+\`\`\`
+
+---
+
+## Roadmap
+
+Next up: expanded threat detection patterns, container image, additional
+MCP server-specific integrations. Contribution welcome once the API
+surface stabilizes — expected around v0.2.
+
+---
+
+## License
+
+MIT
