@@ -22,3 +22,7 @@ logs/
 /misc
 build/
 
+
+.coverage
+.coverage.*
+htmlcov/
