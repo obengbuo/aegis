@@ -123,6 +123,17 @@ def write_record(
     with LOG_PATH.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record) + "\n")
 
+    # JSONL is now durable. Everything below is a best-effort mirror that must
+    # never block or fail the caller — the same fail-open contract for both
+    # sinks. Ship to the control plane first (a non-blocking enqueue; no-op
+    # unless one is configured), then mirror as an OTLP span.
+    #
+    # Imported lazily to keep audit's import graph free of any load-order
+    # coupling to aegis.shipper; the module object is cached after first use.
+    from aegis import shipper
+
+    shipper.enqueue(record)
+
     if otlp_endpoint:
         _emit_otlp_span(record, otlp_endpoint)
 

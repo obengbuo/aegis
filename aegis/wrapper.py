@@ -75,6 +75,16 @@ def wrap_toolset(
     run_id = config.run_id if config is not None else None
     approval_callback = config.approval_callback if config is not None else None
     response_inspection_mode = config.response_inspection_mode if config is not None else "off"
+
+    # Activate control-plane shipping if configured. Idempotent and cheap:
+    # configure() installs one process-global shipper the first time a
+    # control_plane_url is seen and reuses it thereafter, so wrapping many
+    # servers never spawns more than one background thread. No-op when unset.
+    # Shipping is best-effort and off the enforcement path — see aegis/shipper.py.
+    if config is not None and config.control_plane_url:
+        from aegis import shipper
+
+        shipper.configure(config)
     toolset.process_tool_call = make_process_tool_call(
         server_name,
         spec,

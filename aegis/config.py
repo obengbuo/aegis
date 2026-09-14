@@ -45,3 +45,11 @@ class AegisConfig:
     # to audit but still returns the response; "block" additionally raises
     # PermissionError for block-tier matches. See aegis/response_inspection.py.
     response_inspection_mode: Literal["off", "warn", "block"] = "off"
+    # Control-plane shipping (aegis-controlplane). All three default to None:
+    # shipping is inert unless control_plane_url is set. When set, audit
+    # records are POSTed best-effort to {control_plane_url}/v1/records on a
+    # background thread — never on the enforcement path. deployment_id labels
+    # this deployment's stream in the aggregated backend. See aegis/shipper.py.
+    control_plane_url: str | None = None
+    control_plane_api_key: str | None = None
+    deployment_id: str | None = None
