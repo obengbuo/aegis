@@ -24,7 +24,7 @@ Requires Python 3.10+.
 
 ## Quick start
 
-See [docs/WAXELL_INTEGRATION.md](docs/WAXELL_INTEGRATION.md) for a complete
+See [docs/INTEGRATION.md](docs/INTEGRATION.md) for a complete
 runnable example and integration reference.
 
 The five-line version: wrap any Pydantic AI `MCPToolset` with `wrap_toolset()`,
