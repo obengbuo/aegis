@@ -11,7 +11,9 @@ load_spec() runs once at run start, validates the spec, and emits one audit reco
 from __future__ import annotations
 
 import hashlib
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -313,6 +315,8 @@ def load_spec(path: str | Path) -> CapabilitySpec:
         raise SpecValidationError(f"spec validation failed in '{path}': {errors}") from exc
 
     write_record({
+        "call_id": str(uuid.uuid4()),
+        "ts": datetime.now(timezone.utc).isoformat(),
         "status": "spec_loaded",
         "task": spec.task,
         "deny_all_others": spec.deny_all_others,

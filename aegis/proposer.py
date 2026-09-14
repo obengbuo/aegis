@@ -14,6 +14,8 @@ Trust boundary (enforced structurally, not just by prompt):
 from __future__ import annotations
 
 import hashlib
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
@@ -131,6 +133,8 @@ def propose_spec(user_request: str, sandbox_root: Path) -> CapabilitySpec:
     if tool_name == "request_clarification":
         question: str = tool_input.get("question", "(no question provided)")
         write_record({
+            "call_id": str(uuid.uuid4()),
+            "ts": datetime.now(timezone.utc).isoformat(),
             "status": "spec_clarification_requested",
             "question": question,
             # user_request is repr()'d to prevent newline injection into the
@@ -155,6 +159,8 @@ def propose_spec(user_request: str, sandbox_root: Path) -> CapabilitySpec:
         data = yaml.safe_load(spec_yaml)
     except yaml.YAMLError as exc:
         write_record({
+            "call_id": str(uuid.uuid4()),
+            "ts": datetime.now(timezone.utc).isoformat(),
             "status": "proposer_validation_failed",
             "error": f"YAML parse error: {exc}",
             "proposer_prompt_hash": PROPOSER_PROMPT_HASH,
@@ -166,6 +172,8 @@ def propose_spec(user_request: str, sandbox_root: Path) -> CapabilitySpec:
     if not isinstance(data, dict):
         err = f"YAML root must be a mapping, got {type(data).__name__!r}"
         write_record({
+            "call_id": str(uuid.uuid4()),
+            "ts": datetime.now(timezone.utc).isoformat(),
             "status": "proposer_validation_failed",
             "error": err,
             "proposer_prompt_hash": PROPOSER_PROMPT_HASH,
@@ -180,6 +188,8 @@ def propose_spec(user_request: str, sandbox_root: Path) -> CapabilitySpec:
             for e in exc.errors()
         )
         write_record({
+            "call_id": str(uuid.uuid4()),
+            "ts": datetime.now(timezone.utc).isoformat(),
             "status": "proposer_validation_failed",
             "error": errors,
             "proposer_prompt_hash": PROPOSER_PROMPT_HASH,
@@ -190,6 +200,8 @@ def propose_spec(user_request: str, sandbox_root: Path) -> CapabilitySpec:
 
     # ── Audit — mirrors load_spec's spec_loaded record + proposer provenance ──
     write_record({
+        "call_id": str(uuid.uuid4()),
+        "ts": datetime.now(timezone.utc).isoformat(),
         "status": "spec_loaded",
         "task": spec.task,
         "deny_all_others": spec.deny_all_others,
