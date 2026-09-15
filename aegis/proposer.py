@@ -80,7 +80,9 @@ _TOOLS: list[anthropic.types.ToolParam] = [
 ]
 
 
-def propose_spec(user_request: str, sandbox_root: Path) -> CapabilitySpec:
+def propose_spec(
+    user_request: str, sandbox_root: Path, run_id: str | None = None
+) -> CapabilitySpec:
     """Propose a minimum capability spec from a natural-language user request.
 
     Calls Anthropic once with tool_choice="any" to force a structured response.
@@ -94,6 +96,16 @@ def propose_spec(user_request: str, sandbox_root: Path) -> CapabilitySpec:
     Trust boundary: user_request is passed only as the user-role message.
     sandbox_root is embedded only in the system-role context alongside the
     system prompt. Neither flows into tool schemas or across roles.
+
+    run_id, when supplied, is stamped onto the spec_loaded record this emits on
+    success — the same correlation id you thread into wrap_toolset — so the
+    control plane can link the proposed spec that opened a run to that run's
+    tool calls. It rides only the spec_loaded record; the clarification and
+    validation-failure records are dead ends that never open a run. Omit it and
+    the record is unchanged from before. It is a bare string, not the whole
+    config, for the same reason as load_spec: one field is needed, and taking a
+    string avoids threading (and second-guessing) config.sandbox_root against
+    the sandbox_root already passed here.
     """
     # ── System message: operator-controlled content only ─────────────────────
     # sandbox_root is trusted (operator-supplied). It is prepended to the system
@@ -208,6 +220,6 @@ def propose_spec(user_request: str, sandbox_root: Path) -> CapabilitySpec:
         "spec_hash": spec.spec_hash,
         "proposer_prompt_hash": PROPOSER_PROMPT_HASH,
         "proposed": True,
-    })
+    }, run_id=run_id)  # write_record adds run_id only when it is not None
 
     return spec

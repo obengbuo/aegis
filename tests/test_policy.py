@@ -590,6 +590,38 @@ def test_load_spec_emits_spec_loaded_audit_record(tmp_path, temp_log):
     assert r["spec_hash"] == spec.spec_hash
 
 
+def test_load_spec_stamps_run_id_when_supplied(tmp_path, temp_log):
+    """A run_id passed to load_spec rides the spec_loaded record, so the
+    control plane can link the record that opened a run to that run's calls."""
+    f = tmp_path / "spec.yaml"
+    _write_yaml(f, {
+        "task": "test run_id present",
+        "servers": {"filesystem": {"tools": {"read_text_file": None}}},
+    })
+    load_spec(f, run_id="run-abc-123")
+
+    records = [json.loads(line) for line in temp_log.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["status"] == "spec_loaded"
+    assert records[0]["run_id"] == "run-abc-123"
+
+
+def test_load_spec_omits_run_id_when_not_supplied(tmp_path, temp_log):
+    """Without a run_id the record is exactly as it was before the feature —
+    no run_id key at all. Backward compatible for callers that pass only a path."""
+    f = tmp_path / "spec.yaml"
+    _write_yaml(f, {
+        "task": "test run_id absent",
+        "servers": {"filesystem": {"tools": {"read_text_file": None}}},
+    })
+    load_spec(f)  # no run_id
+
+    records = [json.loads(line) for line in temp_log.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["status"] == "spec_loaded"
+    assert "run_id" not in records[0]
+
+
 def test_load_spec_hash_matches_sha256_of_raw_bytes(tmp_path):
     f = tmp_path / "spec.yaml"
     raw = b"task: hash test\nservers:\n  filesystem:\n    tools:\n      read_text_file:\n"

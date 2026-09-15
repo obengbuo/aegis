@@ -277,7 +277,7 @@ def _evaluate_capability_rules(
 # ---------------------------------------------------------------------------
 
 
-def load_spec(path: str | Path) -> CapabilitySpec:
+def load_spec(path: str | Path, run_id: str | None = None) -> CapabilitySpec:
     """Load and validate a capability spec from a YAML file.
 
     Raises SpecValidationError on any error (missing file, bad YAML, schema
@@ -285,6 +285,15 @@ def load_spec(path: str | Path) -> CapabilitySpec:
 
     On success, writes one spec_loaded audit record so every run has an
     immutable anchor to the spec that governed it.
+
+    run_id, when supplied, is stamped onto that spec_loaded record so the
+    control plane can link the record that OPENED a run to the tool-call
+    records that followed it — pass the same AegisConfig.run_id you thread
+    into wrap_toolset. It is a single correlation id, not the whole config,
+    deliberately: this loader needs exactly one field, and taking a bare
+    string keeps policy.py free of any dependency on config.py. Omit it
+    (Phase 1 callers, or a load with no run yet) and the record is unchanged
+    from before — no run_id key at all.
     """
     path = Path(path)
 
@@ -321,6 +330,6 @@ def load_spec(path: str | Path) -> CapabilitySpec:
         "task": spec.task,
         "deny_all_others": spec.deny_all_others,
         "spec_hash": spec.spec_hash,
-    })
+    }, run_id=run_id)  # write_record adds run_id only when it is not None
 
     return spec

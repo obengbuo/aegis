@@ -134,6 +134,51 @@ the top regardless of where it sits here.
 
 ---
 
+## 5. Audit-record field completeness — is a full write_record call-site pass due?
+
+**The question.** Audit-record fields have been filled in reactively, one at a
+time, each time the control plane's query API turned a documented approximation
+into something it could answer exactly. Two such gaps are now closed (below).
+The open question is whether to do a single deliberate pass over *every*
+`write_record` call site — a dozen-plus across `wrapper.py`, `policy.py`, and
+`proposer.py` — checking each record carries the fields a downstream reader
+needs, rather than continuing to discover them one backend caveat at a time.
+
+**Closed already (control-plane-driven — do not re-open).**
+- `response_inspection_mode` on the `response_pattern_detected` record — **DONE**.
+  Lets the control plane's `/v1/denials` view distinguish a *blocked* response
+  from one merely *warned* and returned to the agent unchanged. The record
+  already carried the verdict (clean/warn/block); it now also carries the
+  configured mode, which is what says whether Aegis actually withheld anything.
+- `run_id` on the `spec_loaded` record — both `load_spec` and `propose_spec` —
+  **DONE**. Lets `/v1/runs/{run_id}` return the record that *opened* a run by
+  exact `run_id` match, instead of inferring the association from this
+  deployment's `spec_hash` + timestamp ordering (an inference that is knowably
+  ambiguous when the same spec was loaded twice before a run). Optional
+  parameter; omitted → the record is unchanged from before. Chosen as a bare
+  `run_id` string rather than the whole `AegisConfig` so the loader stays free
+  of any dependency on `config.py`. See CONTROL_PLANE_DESIGN.md §7.
+
+**Still open — the general pass.**
+Whether to audit all `write_record` call sites at once. *Against:* it is
+speculative — adding fields no consumer has asked for is guessing, and each of
+the two fixes above came from a concrete downstream need, which is the right
+forcing function. *For:* discovering these one at a time means the backend
+ships a caveat, then later a migration, for each; a single pass might retire
+several caveats in one release.
+
+**Trigger.** Do the pass when a *third* control-plane caveat traces back to a
+missing library field — two is coincidence, three is a pattern worth an hour of
+systematic review. Until then, keep fixing them as concrete needs surface.
+
+**Do not** add record fields no control-plane route actually consumes yet.
+
+---
+
 ## Revision log
 
 - **Week 7** — First version. Four questions logged with explicit triggers.
+- **2026-09-14** — Added Q5 (audit-record field completeness). Logged two
+  control-plane-driven fixes as done — `response_inspection_mode` on
+  `response_pattern_detected`, `run_id` on `spec_loaded` — with the general
+  write_record call-site review left open behind a rule-of-three trigger.
