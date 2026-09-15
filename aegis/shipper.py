@@ -30,6 +30,18 @@ Design consequences of that rule:
     actually configured — callers that never configure one pay nothing.
   * Shutdown makes exactly one final flush attempt, bounded by a timeout, and
     is allowed to fail: unshipped records simply remain in JSONL.
+
+Fail-open is not the same as fail-silent. Every way shipping can fail must
+leave a signal, or "records are safely local" is indistinguishable from
+"records are arriving". Two mechanisms carry that:
+
+  * Failures are classified by whether retrying can fix them (see
+    _PostOutcome). A 4xx is a configuration error, reported immediately and
+    not retried; a 5xx or transport error is transient, retried with backoff
+    and reported only once it has outlived a blip.
+  * Reports are deduplicated per failure signature per outage, because a
+    stderr line every few seconds is the noise that teaches operators to stop
+    reading stderr.
 """
 
 from __future__ import annotations
@@ -38,7 +50,7 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from aegis.config import AegisConfig
@@ -72,6 +84,39 @@ _missed_lock = threading.Lock()
 _missed_count = 0
 _missed_statuses: dict[str, int] = {}
 _missed_run_ids: set[str] = set()
+
+
+# The outcome of one POST attempt. The distinction that matters is not
+# success/failure but whether a failure can EVER succeed if repeated:
+#
+#   "ok"        — 2xx. Delivered.
+#   "permanent" — 4xx. A configuration error: a bad key, the wrong URL, a batch
+#                 over the size cap, a payload the backend can't parse. The
+#                 identical request will be rejected identically forever, so
+#                 retrying accomplishes nothing but hiding the problem.
+#   "transient" — 5xx or a transport exception. The backend is restarting, or
+#                 the network is down. This is what backoff is for.
+#
+# Collapsing these two into one boolean is what made a wrong API key
+# indistinguishable from a working deployment: the 401 was retried forever and
+# never reported, so records silently stayed local while everything looked fine.
+_PostOutcome = Literal["ok", "transient", "permanent"]
+
+# status -> what an operator should go and check. Shown verbatim in the warning,
+# so each one names a specific thing to change rather than restating the code.
+_PERMANENT_HINTS: dict[int, str] = {
+    400: "the control plane rejected the batch as malformed — the library and "
+         "control plane may be version-mismatched",
+    401: "invalid or missing API key — check AegisConfig.control_plane_api_key "
+         "against the control plane's own configuration",
+    403: "the API key was rejected for this deployment — check it grants write "
+         "access for AegisConfig.deployment_id",
+    404: "no /v1/records endpoint at this URL — check AegisConfig.control_plane_url",
+    413: "the batch exceeded the control plane's size cap — lower the shipper's "
+         "batch_max_count, or raise the cap on the backend",
+    422: "the control plane could not parse the batch payload — the library and "
+         "control plane may be version-mismatched",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +181,7 @@ class _Shipper:
         initial_backoff: float = 0.5,
         max_backoff: float = 30.0,
         warn_interval: float = 30.0,
+        transient_warn_after: int = 3,
         start: bool = True,
     ) -> None:
         # _base_url is retained (not just the derived POST target) so
@@ -151,6 +197,11 @@ class _Shipper:
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
         self._warn_interval = warn_interval
+        # A transient failure that resolves on the next attempt is a blip, not
+        # an incident; warning about it is the noise that teaches operators to
+        # ignore stderr. Stay quiet until a failure has survived this many
+        # consecutive attempts, then say it once.
+        self._transient_warn_after = transient_warn_after
 
         self._headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
@@ -165,6 +216,11 @@ class _Shipper:
         self._dropped_total = 0    # dropped over the shipper's lifetime
         self._client: Any = None
         self._last_warn = 0.0
+        # Failure signatures already reported ("HTTP 401", "ConnectionError"),
+        # so one outage produces one line rather than one line per retry.
+        # Cleared on any successful POST, so a LATER outage is reported again.
+        self._warned_failures: set[str] = set()
+        self._consecutive_transient = 0
 
         # _wake lets enqueue() nudge the worker the instant the count threshold
         # is crossed, instead of waiting out the age timer. _stop ends the loop.
@@ -263,24 +319,46 @@ class _Shipper:
             self._dropped = max(0, self._dropped - reported)
 
     def _deliver(self, batch: list[dict[str, Any]], dropped: int, allow_backoff: bool) -> bool:
-        """POST one batch. If allow_backoff, retry with exponential backoff
-        until success or shutdown. Returns True on success, False only when
-        abandoned due to shutdown. Never raises."""
+        """POST one batch, retrying only failures that retrying can fix.
+
+        Returns True when delivered; False when abandoned — either because
+        shutdown cut the retries short, or because the control plane rejected
+        the batch with a 4xx, which no number of identical retries will change.
+        An abandoned batch is not lost: JSONL already holds every record.
+        Never raises.
+        """
         backoff = self._initial_backoff
         while True:
-            if self._post(batch, dropped):
+            outcome = self._post(batch, dropped)
+            if outcome == "ok":
                 return True
+            if outcome == "permanent":
+                # Already reported by _post; retrying would only hide it. Count
+                # the abandoned records as dropped so the gap rides the next
+                # SUCCESSFUL batch as dropped_since_last_batch. Without this a
+                # 413 — which rejects only oversized batches, not all of them —
+                # would leave a hole in the centralised view that the backend
+                # had no way to know about: the same silent-gap problem this
+                # classification exists to remove.
+                with self._lock:
+                    self._dropped += len(batch)
+                    self._dropped_total += len(batch)
+                return False
             if not allow_backoff:
                 return False  # shutdown: single attempt, no waiting
             # Interruptible backoff. If shutdown fires mid-wait, take one final
             # shot so a transient failure right at shutdown still gets a chance.
             if self._stop.wait(timeout=backoff):
-                return self._post(batch, dropped)
+                return self._post(batch, dropped) == "ok"
             backoff = min(backoff * 2, self._max_backoff)
 
-    def _post(self, batch: list[dict[str, Any]], dropped: int) -> bool:
-        """A single POST attempt. Returns True on a 2xx, False on any failure
-        (network error or non-2xx). Never raises."""
+    def _post(self, batch: list[dict[str, Any]], dropped: int) -> _PostOutcome:
+        """One POST attempt, classified. Never raises.
+
+        Reports failures at most once per distinct signature per outage — see
+        _warn_failure_once. A success clears the reported set, so a genuinely
+        new outage later is reported again rather than swallowed.
+        """
         try:
             client = self._get_or_create_client()
             payload = {
@@ -289,10 +367,62 @@ class _Shipper:
                 "records": batch,
             }
             status = client.post(self._url, payload, self._headers)
-            return 200 <= status < 300
         except Exception as exc:  # noqa: BLE001 — shipping failure is never fatal
-            print(f"[aegis] shipper POST to {self._url} failed: {exc}", file=sys.stderr)
-            return False
+            return self._note_transient(f"{type(exc).__name__}: {exc}")
+
+        if 200 <= status < 300:
+            self._note_success()
+            return "ok"
+
+        if 400 <= status < 500:
+            self._note_permanent(status)
+            return "permanent"
+
+        return self._note_transient(f"HTTP {status}")
+
+    # -- failure classification & reporting ---------------------------------
+
+    def _note_success(self) -> None:
+        """Reset outage state so a future failure is reported as news."""
+        self._consecutive_transient = 0
+        self._warned_failures.clear()
+
+    def _note_permanent(self, status: int) -> None:
+        """Report a 4xx immediately: there is no point waiting to see whether
+        it resolves, because it cannot."""
+        self._consecutive_transient = 0
+        hint = _PERMANENT_HINTS.get(status, "the control plane rejected the batch")
+        self._warn_failure_once(
+            f"HTTP {status}",
+            [
+                f"[aegis] control plane rejected a batch: HTTP {status} — {hint}.",
+                "        This batch will NOT be retried; a 4xx cannot succeed as sent.",
+                "        Its records remain in JSONL, which is the durable record.",
+                "        Shipping continues for later batches; this is reported once.",
+            ],
+        )
+
+    def _note_transient(self, signature: str) -> _PostOutcome:
+        """Count a retryable failure, and report it only once it has stopped
+        looking like a blip."""
+        self._consecutive_transient += 1
+        if self._consecutive_transient >= self._transient_warn_after:
+            self._warn_failure_once(
+                signature,
+                [
+                    f"[aegis] control plane unreachable: {signature} "
+                    f"(attempt {self._consecutive_transient}).",
+                    "        Still retrying with backoff — records stay queued and in",
+                    "        JSONL. This is reported once per outage, not per retry.",
+                ],
+            )
+        return "transient"
+
+    def _warn_failure_once(self, signature: str, lines: list[str]) -> None:
+        if signature in self._warned_failures:
+            return
+        self._warned_failures.add(signature)
+        print(*lines, sep="\n", file=sys.stderr)
 
     def _get_or_create_client(self) -> Any:
         if self._client is None:

@@ -89,12 +89,26 @@ class FakePoster:
     (to exercise a hung backend at shutdown). Thread-safe: post() runs on the
     shipper's worker thread while the test asserts on the main thread."""
 
-    def __init__(self, fail_first: int = 0, exc: Exception | None = None, block: threading.Event | None = None):
+    def __init__(
+        self,
+        fail_first: int = 0,
+        exc: Exception | None = None,
+        block: threading.Event | None = None,
+        status: int | None = None,
+        status_first: int = 0,
+    ):
+        """fail_first / exc  -> raise a transport exception for the first N calls.
+        status / status_first -> return an HTTP status instead of raising:
+            status_first=0 (default) means EVERY call returns `status`;
+            status_first=N means only the first N calls do, then 200.
+        """
         self.calls: list[dict] = []
         self._lock = threading.Lock()
         self._fail_first = fail_first
         self._exc = exc or ConnectionError("simulated unreachable control plane")
         self._block = block
+        self._status = status
+        self._status_first = status_first
 
     def post(self, url, payload, headers):
         # Record first, so a blocked/failing call is still observable.
@@ -105,6 +119,8 @@ class FakePoster:
             self._block.wait(timeout=10)
         if n <= self._fail_first:
             raise self._exc
+        if self._status is not None and (self._status_first == 0 or n <= self._status_first):
+            return self._status
         return 200
 
     def shipped(self) -> list[dict]:
@@ -716,3 +732,217 @@ def test_conflicting_control_plane_url_warns_and_first_wins(monkeypatch, tmp_pat
     # only the silence removed.
     assert shipper._active_shipper is not None
     assert shipper._active_shipper._url.startswith("http://first.invalid")
+
+
+# ---------------------------------------------------------------------------
+# 12. HTTP FAILURE CLASSIFICATION.
+#
+#     A non-2xx response used to be indistinguishable from success from the
+#     operator's side: _post returned False, the batch was retried with
+#     backoff forever, and nothing was printed unless the transport itself
+#     raised. A wrong API key therefore looked exactly like a working
+#     deployment — enforcement correct, JSONL durable, records silently never
+#     arriving. Same class as the activation bug in section 11.
+#
+#     4xx is a configuration error: it cannot succeed as sent, so it warns
+#     and the batch is abandoned (to JSONL, which already holds it).
+#     5xx and transport errors are transient: they keep retrying, and stay
+#     quiet unless the failure persists, because a line every few seconds
+#     during an outage is noise that trains operators to ignore it.
+# ---------------------------------------------------------------------------
+
+
+def _drain(sh, fake, n_calls: int, timeout: float = 3.0) -> bool:
+    return _wait_until(lambda: len(fake.calls) >= n_calls, timeout=timeout)
+
+
+def test_4xx_warns_and_does_not_retry_the_batch(temp_log, capsys):
+    """A 401 is a bad key. Retrying cannot fix it, so the batch is abandoned
+    after ONE attempt and the operator is told what to check."""
+    fake = FakePoster(status=401)
+    sh = _Shipper(
+        url="http://cp", deployment_id="d",
+        batch_max_count=1, batch_max_age=100.0,
+        initial_backoff=0.01, max_backoff=0.02, start=False,
+    )
+    sh._client = fake
+    sh.start()
+    try:
+        sh.enqueue({"call_id": "c0", "ts": "t", "status": "spec_loaded"})
+        assert _drain(sh, fake, 1), "the batch was never attempted"
+        # Give the worker ample time to retry if it were going to.
+        time.sleep(0.3)
+        assert len(fake.calls) == 1, (
+            f"a 401 batch was retried {len(fake.calls)} times; it can never succeed as sent"
+        )
+    finally:
+        sh.shutdown(timeout=1.0)
+
+    flat = " ".join(capsys.readouterr().err.split())
+    assert "HTTP 401" in flat
+    assert "control_plane_api_key" in flat
+    assert "NOT be retried" in flat
+
+
+def test_4xx_warns_once_across_many_batches(temp_log, capsys):
+    """Every batch will hit the same 401. The operator hears it once."""
+    fake = FakePoster(status=401)
+    sh = _Shipper(
+        url="http://cp", deployment_id="d",
+        batch_max_count=1, batch_max_age=0.05,
+        initial_backoff=0.01, max_backoff=0.02, start=False,
+    )
+    sh._client = fake
+    sh.start()
+    try:
+        for i in range(5):
+            sh.enqueue({"call_id": f"c{i}", "ts": "t", "status": "ok"})
+        assert _drain(sh, fake, 5), "subsequent batches were not attempted"
+    finally:
+        sh.shutdown(timeout=1.0)
+
+    # Draining continued (so the queue cannot grow without bound) but the
+    # warning did not repeat per batch.
+    assert capsys.readouterr().err.count("HTTP 401") == 1
+
+
+def test_413_names_the_batch_size_cause(temp_log, capsys):
+    """Different 4xx codes mean different misconfigurations; the warning says
+    which. 413 is the one that is per-batch rather than per-deployment."""
+    fake = FakePoster(status=413)
+    sh = _Shipper(url="http://cp", deployment_id="d", batch_max_count=1,
+                  batch_max_age=100.0, start=False)
+    sh._client = fake
+    sh.start()
+    try:
+        sh.enqueue({"call_id": "c0", "ts": "t", "status": "ok"})
+        assert _drain(sh, fake, 1)
+    finally:
+        sh.shutdown(timeout=1.0)
+
+    flat = " ".join(capsys.readouterr().err.split())
+    assert "HTTP 413" in flat
+    assert "batch" in flat.lower()
+
+
+def test_5xx_retries_silently_and_succeeds(temp_log, capsys):
+    """A backend restart must not need operator intervention, and must not
+    print anything: two 500s then a 200 is a blip, not an incident."""
+    fake = FakePoster(status=500, status_first=2)  # 500, 500, then 200
+    sh = _Shipper(
+        url="http://cp", deployment_id="d",
+        batch_max_count=2, batch_max_age=100.0,
+        initial_backoff=0.02, max_backoff=0.05, start=False,
+    )
+    sh._client = fake
+    sh.start()
+    try:
+        sh.enqueue({"call_id": "r0", "ts": "t", "status": "ok"})
+        sh.enqueue({"call_id": "r1", "ts": "t", "status": "ok"})
+        assert _drain(sh, fake, 3), "a 500 was not retried to success"
+        # The SAME records are redelivered every attempt — nothing is lost.
+        for call in fake.calls[:3]:
+            assert {r["call_id"] for r in call["payload"]["records"]} == {"r0", "r1"}
+        time.sleep(0.1)
+        assert len(fake.calls) == 3, "kept retrying after success"
+    finally:
+        sh.shutdown(timeout=1.0)
+
+    assert capsys.readouterr().err == "", "a recovered 5xx blip must be silent"
+
+
+def test_persistent_5xx_eventually_warns_once(temp_log, capsys):
+    """Silence is for blips, not outages. A 500 that keeps failing is
+    reported — once, not per retry."""
+    fake = FakePoster(status=500)
+    sh = _Shipper(
+        url="http://cp", deployment_id="d",
+        batch_max_count=1, batch_max_age=100.0,
+        initial_backoff=0.01, max_backoff=0.02, start=False,
+    )
+    sh._client = fake
+    sh.start()
+    try:
+        sh.enqueue({"call_id": "c0", "ts": "t", "status": "ok"})
+        assert _drain(sh, fake, 6), "a persistent 500 stopped being retried"
+    finally:
+        sh.shutdown(timeout=1.0)
+
+    err = capsys.readouterr().err
+    assert err.count("HTTP 500") == 1, f"expected exactly one warning, got:\n{err}"
+    assert "retrying" in err.lower()
+
+
+def test_transport_exception_still_retries_and_warns_once(temp_log, capsys):
+    """Connection refused is transient, like a 5xx. It used to print on every
+    single attempt; now it is reported once per outage."""
+    fake = FakePoster(fail_first=10**9)  # every attempt raises
+    sh = _Shipper(
+        url="http://cp", deployment_id="d",
+        batch_max_count=1, batch_max_age=100.0,
+        initial_backoff=0.01, max_backoff=0.02, start=False,
+    )
+    sh._client = fake
+    sh.start()
+    try:
+        sh.enqueue({"call_id": "c0", "ts": "t", "status": "ok"})
+        assert _drain(sh, fake, 6), "a transport failure stopped being retried"
+    finally:
+        sh.shutdown(timeout=1.0)
+
+    assert capsys.readouterr().err.count("ConnectionError") == 1
+
+
+def test_4xx_does_not_break_enforcement(monkeypatch, temp_log):
+    """The non-negotiable, restated for the new failure class: a 401 changes
+    nothing about the decision or the durable record."""
+    fake = FakePoster(status=401)
+    monkeypatch.setattr(shipper, "_build_client", lambda timeout: fake)
+
+    config = _cp_config(temp_log.parent)
+    toolset = MCPToolset(StdioTransport("python", ["-c", "pass"]))
+    wrap_toolset(toolset, "filesystem", spec=_allow_spec(), config=config)
+
+    async def fake_call_tool(tool_name, args):
+        return "file contents"
+
+    assert asyncio.run(
+        toolset.process_tool_call(FakeCtx(), fake_call_tool, "read_text_file", {"path": "/x"})
+    ) == "file contents"
+    with pytest.raises(PermissionError):
+        asyncio.run(
+            toolset.process_tool_call(FakeCtx(), fake_call_tool, "write_file", {"path": "/x"})
+        )
+    _flush()
+
+    statuses = [json.loads(x)["status"] for x in temp_log.read_text().splitlines()]
+    assert "ok" in statuses and "denied" in statuses
+
+
+def test_permanently_rejected_batch_is_reported_as_a_gap(temp_log):
+    """A 413 rejects oversized batches, not all of them — so an abandoned
+    batch must show up as dropped_since_last_batch on the next batch that
+    lands. Otherwise the centralised view has a hole nobody can see, which is
+    the failure mode this whole classification exists to remove."""
+    fake = FakePoster(status=413, status_first=1)  # first batch rejected, then 200
+    sh = _Shipper(
+        url="http://cp", deployment_id="d",
+        batch_max_count=1, batch_max_age=0.05,
+        initial_backoff=0.01, max_backoff=0.02, start=False,
+    )
+    sh._client = fake
+    sh.start()
+    try:
+        sh.enqueue({"call_id": "lost", "ts": "t", "status": "spec_loaded"})
+        assert _drain(sh, fake, 1), "first batch never attempted"
+        sh.enqueue({"call_id": "kept", "ts": "t", "status": "ok"})
+        assert _drain(sh, fake, 2), "shipping did not continue after a 4xx"
+    finally:
+        sh.shutdown(timeout=1.0)
+
+    # The abandoned record was attempted exactly once and not redelivered ...
+    assert [r["call_id"] for r in fake.calls[0]["payload"]["records"]] == ["lost"]
+    second = fake.calls[1]["payload"]
+    assert [r["call_id"] for r in second["records"]] == ["kept"]
+    # ... but the backend is told one record went missing.
+    assert second["dropped_since_last_batch"] == 1
