@@ -8,7 +8,7 @@ capability specs, enforces those specs at the tool-call layer with no LLM
 in the enforcement path, and produces a forensic audit trail for every
 decision.
 
-**Status:** v0.2.0 — pre-production, actively developed with a design partner.
+**Status:** v0.2.0 — pre-production, public, and installable.
 
 ---
 
