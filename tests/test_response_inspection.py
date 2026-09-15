@@ -196,6 +196,9 @@ def test_wrapper_response_inspection_warn_mode_logs_but_returns(temp_log, tmp_pa
 
     detected = next(r for r in records if r["status"] == "response_pattern_detected")
     assert detected["response_inspection_verdict"] == "warn"
+    # The configured mode rides the record too, so downstream can distinguish
+    # "warned and returned" from "blocked" — here the response was returned.
+    assert detected["response_inspection_mode"] == "warn"
     assert any(p["name"] == "ssn" for p in detected["patterns"])
 
     ok_record = next(r for r in records if r["status"] == "ok")
@@ -219,6 +222,8 @@ def test_wrapper_response_inspection_block_mode_raises(temp_log, tmp_path):
     assert len(records) == 1
     assert records[0]["status"] == "response_pattern_detected"
     assert records[0]["response_inspection_verdict"] == "block"
+    # block verdict AND block mode => the response was actually withheld.
+    assert records[0]["response_inspection_mode"] == "block"
     assert _VALID_CC not in json.dumps(records[0])  # not even the audit record leaks it
 
 
@@ -243,3 +248,8 @@ def test_wrapper_response_inspection_block_only_blocks_block_tier(temp_log, tmp_
     assert "ok" in statuses
     detected = next(r for r in records if r["status"] == "response_pattern_detected")
     assert detected["response_inspection_verdict"] == "warn"
+    # The case the field exists for: mode is "block" but the verdict is only
+    # "warn", so the response was returned unchanged. Without the mode a reader
+    # seeing verdict="warn" cannot know block mode was even in force; with both,
+    # it's unambiguous that nothing was withheld.
+    assert detected["response_inspection_mode"] == "block"

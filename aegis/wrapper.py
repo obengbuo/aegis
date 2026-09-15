@@ -271,6 +271,12 @@ async def _process(
                     for p in scan.patterns_matched
                 ],
                 "response_inspection_verdict": scan.verdict,
+                # The configured mode, not just the verdict: it's what lets a
+                # downstream reader (the control plane's /v1/denials view)
+                # tell a blocked response from one that was merely warned and
+                # returned to the agent unchanged. verdict says what the scan
+                # found; mode says what Aegis did about it.
+                "response_inspection_mode": response_inspection_mode,
             }, otlp_endpoint=otlp_endpoint)
 
             if scan.verdict == "block" and response_inspection_mode == "block":
