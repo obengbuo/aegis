@@ -189,6 +189,45 @@ systematic review. Until then, keep fixing them as concrete needs surface.
 
 ---
 
+## Path representation must agree across three places, and nothing checks it
+
+**The question.** Rule 7 does literal string equality on argument values. That
+means the user's request, the proposer's emitted spec, and the agent's actual
+tool call must all agree on how a file is named. Nothing enforces or checks
+that agreement.
+
+**How it surfaced.** A demo run where the request named bare filenames
+("read meeting-notes.txt, agenda.txt, and action-items.txt in the sandbox").
+The proposer emitted absolute paths per R3. The agent, having never seen an
+absolute path, invented a `sandbox/` prefix and called
+`read_text_file(path="sandbox/agenda.txt")`. All three legitimate reads were
+refused. Aegis behaved correctly — the spec genuinely did not permit that
+string — but the refusal reason said "not in capability spec" without
+conveying that the two strings describe the same file.
+
+The false positive lands on exactly the calls the user asked for, which is the
+worst place for one.
+
+**Why R3 doesn't cover it.** The proposer prompt's R3 governs what the
+proposer *emits*. It says nothing about what the agent *calls with*, and the
+agent never sees the spec.
+
+**Candidate directions, none chosen:**
+- Normalise paths at evaluation time. Rejected on the same grounds as globs in
+  Week 3 — path normalisation is where traversal bypasses live.
+- Have the proposer emit a clarification when the request contains relative or
+  ambiguous paths, rather than resolving them silently.
+- Have the denial reason detect the near-miss (same basename, different
+  prefix) and say so. Doesn't prevent the refusal but makes it diagnosable.
+- Document the constraint prominently in INTEGRATION.md and treat it as an
+  operator responsibility.
+
+**Trigger.** Before a design partner integrates. This will bite whoever tries
+it first, and the failure looks like Aegis being broken rather than a naming
+mismatch.
+
+----
+
 ## Revision log
 
 - **Week 7** — First version. Four questions logged with explicit triggers.
