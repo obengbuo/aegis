@@ -159,6 +159,20 @@ needs, rather than continuing to discover them one backend caveat at a time.
   `run_id` string rather than the whole `AegisConfig` so the loader stays free
   of any dependency on `config.py`. See CONTROL_PLANE_DESIGN.md §7.
 
+**Paired change, waiting on the control plane.**
+- `unshipped_before_configure: N` in the *batch envelope* (alongside
+  `dropped_since_last_batch`), reporting records written before the control
+  plane was configured. Today that gap is reported to **stderr only**, by
+  `shipper._report_missed_records`. stderr is the operator's terminal, which
+  during an unattended run is nobody's terminal — so the dashboard still shows
+  a run whose opening record is merely absent, indistinguishable from a run
+  that never had one. Putting the count on the wire is what would let
+  `/v1/runs/{run_id}` say "this run's `spec_loaded` exists locally but was
+  never shipped" instead of silently falling back to `spec_hash`+timestamp
+  inference. **Blocked on** `/v1/records` consuming the field — adding it
+  first would violate the rule at the bottom of this section. Do them as one
+  paired change, library and backend together.
+
 **Still open — the general pass.**
 Whether to audit all `write_record` call sites at once. *Against:* it is
 speculative — adding fields no consumer has asked for is guessing, and each of
@@ -182,3 +196,10 @@ systematic review. Until then, keep fixing them as concrete needs surface.
   control-plane-driven fixes as done — `response_inspection_mode` on
   `response_pattern_detected`, `run_id` on `spec_loaded` — with the general
   write_record call-site review left open behind a rule-of-three trigger.
+- **2026-09-15** — `run_id` on `spec_loaded` was reaching JSONL but never the
+  control plane: the shipper was activated by `wrap_toolset`, which is the
+  earliest point a *toolset* is known, not the earliest point the
+  *destination* is known. Activation moved to `AegisConfig.__post_init__`.
+  Logged `unshipped_before_configure` above as a paired change. The loader
+  still takes a bare `run_id` and still has no dependency on `config.py` —
+  the coupling added runs config → shipper, the other direction.

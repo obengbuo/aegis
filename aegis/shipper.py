@@ -49,7 +49,29 @@ if TYPE_CHECKING:
 # only because write_record consults this global rather than a per-call
 # parameter — the one structural difference from the OTLP exporter's per-call
 # otlp_endpoint threading.
+#
+# WHEN this global is installed is the whole ballgame. It is installed by
+# configure(), which AegisConfig.__post_init__ calls — i.e. the moment the
+# operator DECLARES a destination. It used to be installed by wrap_toolset,
+# which is the earliest point a TOOLSET is known, not the earliest point the
+# DESTINATION is known. Those are different facts, and every record written
+# between them went to JSONL only, silently — spec_loaded above all, since
+# load_spec must run before a toolset can be wrapped with its spec.
 _active_shipper: "_Shipper | None" = None
+
+# Accounting for records written while no shipper was active. A SUMMARY, not
+# the records: a count, a status tally (bounded by the ~12-value status
+# vocabulary) and a capped run_id sample. Deliberately not a buffer of record
+# bodies — the durable copy is already in JSONL, so there is no bound to pick
+# and no discard policy to design. All the operator needs is to be told which
+# records are only there. Drained and reported by configure(); see
+# _report_missed_records for why nothing is reported when no control plane was
+# ever declared.
+_MISSED_RUN_ID_CAP = 8
+_missed_lock = threading.Lock()
+_missed_count = 0
+_missed_statuses: dict[str, int] = {}
+_missed_run_ids: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +138,11 @@ class _Shipper:
         warn_interval: float = 30.0,
         start: bool = True,
     ) -> None:
-        self._url = url.rstrip("/") + "/v1/records"
+        # _base_url is retained (not just the derived POST target) so
+        # configure() can report a conflicting second configuration in the
+        # operator's own terms.
+        self._base_url = url.rstrip("/")
+        self._url = self._base_url + "/v1/records"
         self._deployment_id = deployment_id
         self._maxsize = maxsize
         self._batch_max_count = batch_max_count
@@ -298,38 +324,145 @@ class _Shipper:
 # ---------------------------------------------------------------------------
 
 
+def _note_missed(record: dict[str, Any]) -> None:
+    """Count one record written while no shipper was active.
+
+    Runs on the audit-write path, so like everything else here it never
+    raises. Records only a summary — see the module-level notes.
+    """
+    global _missed_count
+    try:
+        with _missed_lock:
+            _missed_count += 1
+            status = str(record.get("status", "?"))
+            _missed_statuses[status] = _missed_statuses.get(status, 0) + 1
+            run_id = record.get("run_id")
+            # Capped: a long-lived process that never configures a control
+            # plane must not accumulate run ids forever. A sample is enough to
+            # point an operator at the right run.
+            if run_id is not None and len(_missed_run_ids) < _MISSED_RUN_ID_CAP:
+                _missed_run_ids.add(str(run_id))
+    except Exception as exc:  # noqa: BLE001 — bookkeeping never raises into a write
+        print(f"[aegis] shipper missed-record accounting failed: {exc}", file=sys.stderr)
+
+
+def _report_missed_records(url: str) -> None:
+    """Report, once, that records were written before this control plane was
+    configured — then drain the counters.
+
+    Called ONLY from configure(). That is the design, not an implementation
+    detail: if no control plane is ever declared, nothing was ever expected to
+    ship, and warning would be noise. A warning that fires when nobody asked
+    for shipping teaches operators to ignore it, and then it is noise when it
+    fires for real. So records are counted unconditionally and reported only
+    once a destination exists to have missed them.
+    """
+    global _missed_count
+    with _missed_lock:
+        count = _missed_count
+        statuses = dict(_missed_statuses)
+        run_ids = sorted(_missed_run_ids)
+        _missed_count = 0
+        _missed_statuses.clear()
+        _missed_run_ids.clear()
+
+    if count == 0:
+        return
+
+    lines = [
+        f"[aegis] control plane ({url}) configured AFTER {count} audit record(s) were",
+        "        already written. Those records are in JSONL only and will NOT be",
+        "        shipped:",
+    ]
+    lines += [f"          {status} x{n}" for status, n in sorted(statuses.items())]
+    if run_ids:
+        lines.append(f"        affected run_id(s): {', '.join(run_ids)}")
+    lines += [
+        "        Construct AegisConfig before load_spec/propose_spec so the run's",
+        "        opening record ships. The control plane will fall back to",
+        "        spec_hash+timestamp inference for these runs.",
+    ]
+    print(*lines, sep="\n", file=sys.stderr)
+
+
+def _warn_on_conflict(active: "_Shipper", url: str, deployment_id: str | None) -> None:
+    """Report a second AegisConfig naming a different control plane.
+
+    Aegis installs ONE process-global shipper, so the first configuration wins.
+    That was always true, but was previously silent, and activating at
+    AegisConfig construction makes it reachable by simply building two configs.
+    Removing one silent failure must not introduce another.
+    """
+    if url.rstrip("/") == active._base_url and deployment_id == active._deployment_id:
+        return
+    print(
+        f"[aegis] control plane already configured for {active._base_url} "
+        f"(deployment_id={active._deployment_id}); ignoring a second",
+        f"        AegisConfig naming {url.rstrip('/')} (deployment_id={deployment_id}).",
+        "        The FIRST configuration wins for this process — every record ships",
+        f"        to {active._base_url}. Build one AegisConfig per process, or call",
+        "        aegis.shipper.shutdown() before reconfiguring.",
+        sep="\n",
+        file=sys.stderr,
+    )
+
+
 def configure(config: "AegisConfig") -> "_Shipper | None":
     """Install the process-global shipper from an AegisConfig, if (and only if)
     control_plane_url is set. Idempotent: a shipper already active for this
     process is reused, never duplicated — so multiple wrap_toolset() calls
     don't spawn multiple threads.
 
+    Called from AegisConfig.__post_init__, so activation happens when the
+    operator declares a destination — the earliest moment the destination is
+    known. wrap_toolset also calls it, harmlessly, to cover a config reused
+    after an explicit shutdown().
+
     Returns the active shipper, or None when no control plane is configured.
     """
     global _active_shipper
-    if not getattr(config, "control_plane_url", None):
+    url = getattr(config, "control_plane_url", None)
+    if not url:
         return None
+
+    deployment_id = getattr(config, "deployment_id", None)
     if _active_shipper is not None:
+        _warn_on_conflict(_active_shipper, url, deployment_id)
         return _active_shipper
+
+    # Before accepting records, say what this window already swallowed.
+    _report_missed_records(url)
+
     _active_shipper = _Shipper(
-        url=config.control_plane_url,
+        url=url,
         api_key=getattr(config, "control_plane_api_key", None),
-        deployment_id=getattr(config, "deployment_id", None),
+        deployment_id=deployment_id,
     )
     return _active_shipper
 
 
 def enqueue(record: dict[str, Any]) -> None:
-    """Hand a record to the active shipper. No-op — and zero cost — when no
-    control plane is configured. Never blocks, never raises."""
+    """Hand a record to the active shipper. Never blocks, never raises.
+
+    With no control plane configured this is near-free, but no longer a pure
+    no-op: the record is counted, so that if a control plane is configured
+    later, configure() can name what the window swallowed. JSONL holds the
+    durable copy either way.
+    """
     sh = _active_shipper
     if sh is None:
+        _note_missed(record)
         return
     sh.enqueue(record)
 
 
 def shutdown(timeout: float = 3.0) -> None:
-    """Shut down and clear the process-global shipper, if any."""
+    """Shut down and clear the process-global shipper, if any.
+
+    Missed-record counters are deliberately NOT cleared: records written after
+    this call, with no shipper active, are genuinely unshipped, and a
+    subsequent configure() should say so.
+    """
     global _active_shipper
     sh = _active_shipper
     if sh is not None:

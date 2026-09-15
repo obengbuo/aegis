@@ -1,12 +1,17 @@
 """
 aegis/config.py — AegisConfig: the public configuration surface.
 
-No runtime imports from other aegis.* modules — so it can be imported early
-by aegis/__init__.py without any risk of circular imports as wrapper.py,
+No MODULE-LEVEL imports from other aegis.* modules — so it can be imported
+early by aegis/__init__.py without any risk of circular imports as wrapper.py,
 audit.py, etc. consume its fields. approval_callback's type hint references
 aegis.policy.Decision, but only under TYPE_CHECKING (see below), so that
 stays true at runtime — a type checker sees the real type; nothing is
 actually imported when this module loads.
+
+__post_init__ does import aegis.shipper, but function-locally, at call time
+rather than load time — the same deferred pattern aegis.audit.write_record
+uses. The load-time import graph is unchanged, and tests/test_import_graph.py
+pins that: it fails if this import is ever promoted to module level.
 
 No behavior yet for log_path: pure data, not yet wired into audit.py.
 """
@@ -53,3 +58,35 @@ class AegisConfig:
     control_plane_url: str | None = None
     control_plane_api_key: str | None = None
     deployment_id: str | None = None
+
+    def __post_init__(self) -> None:
+        """Activate control-plane shipping the moment a destination is declared.
+
+        This constructor is the earliest point at which *where records go* is
+        known. wrap_toolset — the previous activation point — is only the
+        earliest point at which a *toolset* is known, which is a different
+        fact. Anything written in between went to JSONL and nowhere else,
+        silently; and that window is guaranteed non-empty in exactly the
+        integrations that want linked run provenance, because
+        run_id=config.run_id forces this config to precede load_spec /
+        propose_spec. Activating here makes the window empty by construction
+        rather than by documentation.
+
+        This keeps the destination out of load_spec and propose_spec entirely:
+        the coupling runs config -> shipper, so neither loader learns about
+        config.py and no sandbox_root-vs-config.sandbox_root contradiction
+        surface reappears. The shipper reads three fields nobody else passes.
+
+        The import is function-local, mirroring aegis.audit.write_record's, so
+        config.py keeps its no-runtime-imports-from-aegis.* property at module
+        load and the config -> shipper edge cannot close into a cycle (shipper
+        names AegisConfig only under TYPE_CHECKING). Pinned by
+        tests/test_import_graph.py. No-op and near-free when
+        control_plane_url is unset — the common case.
+        """
+        if not self.control_plane_url:
+            return
+
+        from aegis import shipper
+
+        shipper.configure(self)

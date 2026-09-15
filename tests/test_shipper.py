@@ -52,13 +52,25 @@ def temp_log(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def reset_active_shipper():
     """Never let a configured global shipper (or its thread) leak between
-    tests. Runs around every test regardless of what it configures."""
-    shipper._active_shipper = None
+    tests. Runs around every test regardless of what it configures.
+
+    The missed-record counters are process-global too, and are drained only by
+    configure(). A test that writes records with no shipper active would
+    otherwise leave a count behind for the next test's configure() to warn
+    about — a spurious warning in one test caused by another.
+    """
+    def _reset():
+        shipper._active_shipper = None
+        shipper._missed_count = 0
+        shipper._missed_statuses.clear()
+        shipper._missed_run_ids.clear()
+
+    _reset()
     yield
     sh = shipper._active_shipper
     if sh is not None:
         sh.shutdown(timeout=1.0)
-    shipper._active_shipper = None
+    _reset()
 
 
 def _wait_until(predicate, timeout: float = 3.0, interval: float = 0.01) -> bool:
@@ -94,6 +106,16 @@ class FakePoster:
         if n <= self._fail_first:
             raise self._exc
         return 200
+
+    def shipped(self) -> list[dict]:
+        """Every record this poster actually received, flattened across batches.
+
+        This is the FAR SIDE of the seam. Assert here, never on a _Shipper's
+        internal _queue: a queue assertion passes whenever a queue exists,
+        however it got there — including when a test hand-installed it.
+        """
+        with self._lock:
+            return [r for call in self.calls for r in call["payload"]["records"]]
 
 
 def _allow_spec(spec_hash: str = "shiphash001") -> CapabilitySpec:
@@ -352,8 +374,16 @@ def test_shutdown_does_not_hang_on_hung_backend(temp_log):
 
 
 # ---------------------------------------------------------------------------
-# 9. Lifecycle records reach the shipper carrying a real call_id and ts,
+# 9. Lifecycle records reach the CONTROL PLANE, carrying a real call_id and ts,
 #    so the backend's derived-call_id path is a fallback, not the norm.
+#
+#    These three tests used to hand-install shipper._active_shipper and then
+#    assert on sh._queue. That assumed away the entire activation path — a
+#    queue assertion passes whenever a queue exists, however it got there —
+#    which is why 113 green tests sat over the spec_loaded shipping bug for as
+#    long as they did. They now drive the public API in the order
+#    docs/INTEGRATION.md prescribes and assert on what the transport received.
+#    See docs/BUILD_PLAN.md discipline rules 6 and 7.
 # ---------------------------------------------------------------------------
 
 
@@ -362,28 +392,67 @@ def _assert_identity(record: dict) -> None:
     datetime.fromisoformat(str(record["ts"]))         # parses => real ISO ts
 
 
-def test_spec_loaded_reaches_shipper_with_identity(tmp_path, temp_log):
-    sh = _Shipper(url="http://cp", deployment_id="d", start=False)
-    shipper._active_shipper = sh
+def _install_fake_poster(monkeypatch) -> FakePoster:
+    """Replace the lazy HTTP-client factory. Must be installed before the first
+    POST; installing it before AegisConfig construction keeps every test's
+    ordering identical to a real integration's."""
+    fake = FakePoster()
+    monkeypatch.setattr(shipper, "_build_client", lambda timeout: fake)
+    return fake
 
-    spec_file = tmp_path / "spec.yaml"
-    spec_file.write_text(
-        yaml.dump({
-            "task": "read one file",
-            "servers": {"filesystem": {"tools": {"read_text_file": {"args": {"path": None}}}}},
-        }),
-        encoding="utf-8",
+
+def _cp_config(sandbox: Path, **kw) -> AegisConfig:
+    """An AegisConfig that declares a control plane.
+
+    Constructing this IS the activation: the moment an operator writes
+    control_plane_url=, shipping is on (T1). No test here calls
+    shipper.configure() by hand, because no integration does.
+    """
+    return AegisConfig(
+        sandbox_root=sandbox,
+        control_plane_url="http://cp.invalid",
+        control_plane_api_key="secret",
+        deployment_id="d",
+        **kw,
     )
-    load_spec(spec_file)
-
-    queued = [r for r in sh._queue if r.get("status") == "spec_loaded"]
-    assert len(queued) == 1
-    _assert_identity(queued[0])
 
 
-def test_spec_clarification_requested_reaches_shipper_with_identity(monkeypatch, temp_log):
-    sh = _Shipper(url="http://cp", deployment_id="d", start=False)
-    shipper._active_shipper = sh
+_SPEC_BODY = {
+    "task": "read one file",
+    "servers": {"filesystem": {"tools": {"read_text_file": {"args": {"path": None}}}}},
+}
+
+
+def _spec_file(tmp_path: Path) -> Path:
+    path = tmp_path / "spec.yaml"
+    path.write_text(yaml.dump(_SPEC_BODY), encoding="utf-8")
+    return path
+
+
+def _flush() -> None:
+    """One final bounded flush attempt, then clear the global shipper.
+
+    Production batching is 100 records / 5s, so a 2-3 record test would
+    otherwise sit in the age wait. shutdown() sets _wake, so this is prompt
+    and deterministic rather than a sleep.
+    """
+    shipper.shutdown(timeout=3.0)
+
+
+def test_spec_loaded_ships_with_identity(monkeypatch, tmp_path, temp_log):
+    fake = _install_fake_poster(monkeypatch)
+    config = _cp_config(tmp_path)
+    load_spec(_spec_file(tmp_path), run_id=config.run_id)
+    _flush()
+
+    shipped = [r for r in fake.shipped() if r.get("status") == "spec_loaded"]
+    assert len(shipped) == 1
+    _assert_identity(shipped[0])
+
+
+def test_spec_clarification_requested_ships_with_identity(monkeypatch, tmp_path, temp_log):
+    fake = _install_fake_poster(monkeypatch)
+    _cp_config(tmp_path)  # declares the control plane; activation is the side effect
 
     _install_fake_anthropic(
         monkeypatch,
@@ -391,15 +460,16 @@ def test_spec_clarification_requested_reaches_shipper_with_identity(monkeypatch,
     )
     with pytest.raises(Exception):
         proposer.propose_spec("do something vague", Path("/sandbox"))
+    _flush()
 
-    queued = [r for r in sh._queue if r.get("status") == "spec_clarification_requested"]
-    assert len(queued) == 1
-    _assert_identity(queued[0])
+    shipped = [r for r in fake.shipped() if r.get("status") == "spec_clarification_requested"]
+    assert len(shipped) == 1
+    _assert_identity(shipped[0])
 
 
-def test_proposer_validation_failed_reaches_shipper_with_identity(monkeypatch, temp_log):
-    sh = _Shipper(url="http://cp", deployment_id="d", start=False)
-    shipper._active_shipper = sh
+def test_proposer_validation_failed_ships_with_identity(monkeypatch, tmp_path, temp_log):
+    fake = _install_fake_poster(monkeypatch)
+    _cp_config(tmp_path)  # declares the control plane; activation is the side effect
 
     # Valid YAML, invalid spec (no 'servers') => the schema-validation branch.
     _install_fake_anthropic(
@@ -408,10 +478,11 @@ def test_proposer_validation_failed_reaches_shipper_with_identity(monkeypatch, t
     )
     with pytest.raises(Exception):
         proposer.propose_spec("read a file", Path("/sandbox"))
+    _flush()
 
-    queued = [r for r in sh._queue if r.get("status") == "proposer_validation_failed"]
-    assert len(queued) == 1
-    _assert_identity(queued[0])
+    shipped = [r for r in fake.shipped() if r.get("status") == "proposer_validation_failed"]
+    assert len(shipped) == 1
+    _assert_identity(shipped[0])
 
 
 # ---------------------------------------------------------------------------
@@ -481,3 +552,167 @@ def test_denied_call_still_denies_when_control_plane_is_dead(monkeypatch, temp_l
 
     records = [json.loads(x) for x in temp_log.read_text().splitlines()]
     assert any(r["status"] == "denied" for r in records)
+
+
+# ---------------------------------------------------------------------------
+# 11. THE ACTIVATION PATH.
+#
+#     Sections 1-10 test the shipper's MECHANISM — queue, batching, retry,
+#     drop accounting, shutdown. This section tests its WIRING: whether a
+#     record written by a real integration, in the order that integration must
+#     use, actually reaches the transport.
+#
+#     The bug these were written for: the shipper was activated by
+#     wrap_toolset, which is the earliest point a TOOLSET is known, not the
+#     earliest point the DESTINATION is known. Every record written between
+#     AegisConfig construction (T1) and wrap_toolset (T2) went to JSONL only,
+#     silently. That window is guaranteed non-empty in exactly the
+#     integrations that want LINKED provenance, because run_id=config.run_id
+#     forces the config to precede load_spec/propose_spec.
+# ---------------------------------------------------------------------------
+
+
+def test_spec_loaded_ships_in_documented_integration_order(monkeypatch, tmp_path, temp_log):
+    """THE REGRESSION TEST. Drives the public API in docs/INTEGRATION.md's
+    order — config, spec, wrap, call — and asserts on the far side of the seam.
+
+    Fails on the pre-fix code with {"ok"}: the spec_loaded record that OPENED
+    the run never left the machine, so /v1/runs/{run_id} can only ever
+    spec_hash-and-timestamp infer the association it was built to know.
+    """
+    fake = _install_fake_poster(monkeypatch)
+
+    config = _cp_config(tmp_path)                                   # 1. destination declared
+    spec = load_spec(_spec_file(tmp_path), run_id=config.run_id)    # 2. spec (needs config.run_id)
+    toolset = MCPToolset(StdioTransport("python", ["-c", "pass"]))
+    wrap_toolset(toolset, "filesystem", spec=spec, config=config)   # 3. enforcement wired
+
+    async def fake_call_tool(tool_name, args):
+        return "file contents"
+
+    asyncio.run(                                                    # 4. one governed call
+        toolset.process_tool_call(FakeCtx(), fake_call_tool, "read_text_file", {"path": "/x"})
+    )
+    _flush()
+
+    shipped = fake.shipped()
+    assert {r["status"] for r in shipped} == {"spec_loaded", "ok"}
+    # The LINKED provenance path, end to end: the opening record and the
+    # tool-call record arrive at the control plane under one run_id.
+    assert {r.get("run_id") for r in shipped} == {config.run_id}
+
+
+def test_proposed_spec_ships_in_documented_integration_order(monkeypatch, tmp_path, temp_log):
+    """Same property for the propose_spec path — the one tools/demo_end_to_end.py
+    uses, and the one whose spec_loaded record carries proposed=True."""
+    fake = _install_fake_poster(monkeypatch)
+    _install_fake_anthropic(
+        monkeypatch,
+        [_FakeBlock("emit_capability_spec", {"spec_yaml": yaml.dump(_SPEC_BODY)})],
+    )
+
+    config = _cp_config(tmp_path)
+    spec = proposer.propose_spec("read one file", tmp_path, run_id=config.run_id)
+    toolset = MCPToolset(StdioTransport("python", ["-c", "pass"]))
+    wrap_toolset(toolset, "filesystem", spec=spec, config=config)
+
+    async def fake_call_tool(tool_name, args):
+        return "file contents"
+
+    asyncio.run(
+        toolset.process_tool_call(FakeCtx(), fake_call_tool, "read_text_file", {"path": "/x"})
+    )
+    _flush()
+
+    shipped = fake.shipped()
+    opening = [r for r in shipped if r["status"] == "spec_loaded"]
+    assert len(opening) == 1
+    assert opening[0]["proposed"] is True
+    assert opening[0]["run_id"] == config.run_id
+    assert {r.get("run_id") for r in shipped} == {config.run_id}
+
+
+def test_ships_regardless_of_wrap_before_spec_order(monkeypatch, tmp_path, temp_log):
+    """Order-independence guard, not a regression test — this order shipped
+    correctly before the fix too (wrap_toolset activated, then load_spec ran).
+    It is here so a future change cannot fix one order by breaking the other."""
+    fake = _install_fake_poster(monkeypatch)
+
+    config = _cp_config(tmp_path)
+    toolset = MCPToolset(StdioTransport("python", ["-c", "pass"]))
+    # wrap FIRST, spec second — the inverse of the documented order.
+    wrap_toolset(toolset, "filesystem", spec=None, config=config)
+    load_spec(_spec_file(tmp_path), run_id=config.run_id)
+    _flush()
+
+    assert [r["status"] for r in fake.shipped()] == ["spec_loaded"]
+
+
+def test_late_control_plane_configuration_warns_naming_missed_records(
+    monkeypatch, tmp_path, temp_log, capsys
+):
+    """The residual window — a spec loaded at import time, the config built
+    later — is reported, not silent. Records already in JSONL will never ship;
+    the operator is told how many, which statuses, and under which run_id."""
+    fake = _install_fake_poster(monkeypatch)
+
+    orphan_run_id = "11111111-2222-3333-4444-555555555555"
+    load_spec(_spec_file(tmp_path), run_id=orphan_run_id)  # no control plane yet
+    assert fake.shipped() == []
+
+    _cp_config(tmp_path)  # configured late
+    _flush()
+
+    # The warning is wrapped for terminal readability, so assert against a
+    # whitespace-collapsed form rather than pinning the exact line breaks.
+    err = capsys.readouterr().err
+    flat = " ".join(err.split())
+    assert "configured AFTER 1 audit record(s)" in flat
+    assert "spec_loaded x1" in flat
+    assert orphan_run_id in flat
+    assert "will NOT be shipped" in flat
+    assert "spec_hash+timestamp inference" in flat
+
+
+def test_no_warning_when_no_control_plane_was_ever_declared(monkeypatch, tmp_path, temp_log, capsys):
+    """Getting the ABSENCE of a warning right matters as much as the warning.
+
+    A warning that fires when nobody asked for shipping trains operators to
+    ignore it, and then it is noise when it fires for real. Records are still
+    counted — that bookkeeping is what makes the warning above possible — but
+    nothing is reported, because no destination was ever declared and so
+    nothing was expected to ship.
+    """
+    def _boom(*a, **k):
+        raise AssertionError("HTTP client must not be built when no control plane is declared")
+
+    monkeypatch.setattr(shipper, "_build_client", _boom)
+
+    AegisConfig(sandbox_root=tmp_path)  # no control_plane_url
+    load_spec(_spec_file(tmp_path))
+
+    assert shipper._active_shipper is None
+    assert shipper._missed_count >= 1          # counted
+    assert "[aegis]" not in capsys.readouterr().err   # but not reported
+
+
+def test_conflicting_control_plane_url_warns_and_first_wins(monkeypatch, tmp_path, temp_log, capsys):
+    """Part A makes a second AegisConfig activate too, so the pre-existing
+    silent 'first configuration wins' behaviour becomes reachable. It now says
+    so, naming both URLs and which one is in force."""
+    _install_fake_poster(monkeypatch)
+
+    AegisConfig(sandbox_root=tmp_path, control_plane_url="http://first.invalid",
+                deployment_id="first")
+    AegisConfig(sandbox_root=tmp_path, control_plane_url="http://second.invalid",
+                deployment_id="second")
+
+    err = capsys.readouterr().err
+    assert "http://first.invalid" in err
+    assert "http://second.invalid" in err
+    assert "FIRST configuration wins" in err
+
+    # The active shipper still targets the first URL — behaviour unchanged,
+    # only the silence removed.
+    assert shipper._active_shipper is not None
+    assert shipper._active_shipper._url.startswith("http://first.invalid")

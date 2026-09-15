@@ -254,3 +254,21 @@ These emerged from real mistakes and saved time both times. Keep them.
    before they're built.** The enforcement-architecture decision in Week 3
    is the first one to follow this rule formally. Future decisions go
    there too. The notes file is the design record, not just trivia.
+
+6. **Assert on the far side of the seam.** Assert what the *transport
+   received*, never what the internal queue holds. A queue assertion passes
+   whenever a queue exists, however it got there — including when the test
+   itself put it there. This is why 113 green tests sat over the `spec_loaded`
+   shipping bug: the three lifecycle tests read `sh._queue`, which was
+   populated because they had assigned `shipper._active_shipper` by hand two
+   lines earlier. `FakePoster.shipped()` in `tests/test_shipper.py` exists to
+   make the far side the easy thing to assert on.
+
+7. **Drive the public API in the documented order; never pre-install
+   internals.** The moment a test writes `shipper._active_shipper = sh`, it has
+   assumed away the activation path — the exact thing most likely to be wrong.
+   Integration-order tests construct `AegisConfig`, then the spec, then wrap,
+   then call, in the order `docs/INTEGRATION.md` prescribes, and let the
+   library wire itself. Mechanism tests may still build internals directly;
+   wiring tests may not. Both kinds are needed, and the second kind is the one
+   that was missing.

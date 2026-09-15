@@ -76,10 +76,14 @@ def wrap_toolset(
     approval_callback = config.approval_callback if config is not None else None
     response_inspection_mode = config.response_inspection_mode if config is not None else "off"
 
-    # Activate control-plane shipping if configured. Idempotent and cheap:
-    # configure() installs one process-global shipper the first time a
-    # control_plane_url is seen and reuses it thereafter, so wrapping many
-    # servers never spawns more than one background thread. No-op when unset.
+    # Belt-and-suspenders only: AegisConfig.__post_init__ already activated
+    # shipping when the operator declared control_plane_url, which is the
+    # earliest point the destination is known. This call is NOT the activation
+    # point any more — it used to be, and that was the bug: load_spec /
+    # propose_spec necessarily run before any toolset can be wrapped with their
+    # spec, so the run's opening record was written before shipping existed and
+    # reached JSONL only. Kept here because configure() is idempotent and this
+    # covers a config reused after an explicit shipper.shutdown().
     # Shipping is best-effort and off the enforcement path — see aegis/shipper.py.
     if config is not None and config.control_plane_url:
         from aegis import shipper
