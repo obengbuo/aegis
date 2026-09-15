@@ -1,9 +1,9 @@
-# Aegis — Waxell Integration Quick Start
+# Aegis — Integration Guide
 
 ## Install
 
 ```bash
-pip install git+https://github.com/obengbuo/aegis.git@v0.1.1
+pip install git+https://github.com/obengbuo/aegis.git@v0.2.0
 ```
 
 ## Complete runnable example (start here if you don't yet have a Pydantic AI agent)
@@ -38,16 +38,18 @@ async def main() -> None:
     )
 
     # 2. Configure Aegis. sandbox_root is trusted; user_request is not.
-    #    Build the config FIRST — see "Path representation" below for why the
-    #    request names an absolute path, and CONTROL_PLANE.md for why config
-    #    construction has to come before the spec.
+    #    The request names an absolute path on purpose — see "Path
+    #    representation" below, the one constraint worth reading before you
+    #    debug a refusal.
     config = AegisConfig(sandbox_root=sandbox)
     user_request = f"Read {notes} and give me a one-line summary."
 
     # 3. Ask the LLM proposer for a minimum-capability spec.
     #    The proposer runs once, upfront, on the trusted user request.
     #    It never sees tool output.
-    spec = propose_spec(user_request, sandbox_root=sandbox)
+    #    run_id is optional; passing it stamps the run's id onto the
+    #    spec_loaded record too, so one grep returns the whole run.
+    spec = propose_spec(user_request, sandbox_root=sandbox, run_id=config.run_id)
 
     # 4. Build a real filesystem MCP server toolset.
     fs = MCPToolset(
@@ -141,8 +143,8 @@ def approve_sensitive_call(server, tool, args, decision) -> bool:
     return True
 
 config = AegisConfig(
-    sandbox_root=Path("/var/waxell/agent-sandbox"),
-    otlp_endpoint="https://otel-collector.waxell.internal:4318",
+    sandbox_root=Path("/var/lib/aegis/sandbox"),
+    otlp_endpoint="https://otel-collector.internal:4318",
     approval_callback=approve_sensitive_call,
     response_inspection_mode="warn",  # "off" | "warn" | "block"
 )
@@ -158,7 +160,7 @@ governed_toolset = wrap_toolset(your_toolset, "your-server-name", config=config)
 ```python
 from aegis import propose_spec, load_spec
 
-sandbox = Path("/var/waxell/sandbox")
+sandbox = Path("/var/lib/aegis/sandbox")
 spec = propose_spec(f"Read {sandbox / 'config.yaml'} and summarize it", sandbox_root=sandbox)
 # or, for a pre-authored operator policy:
 spec = load_spec("specs/config_reader.yaml")
@@ -254,31 +256,40 @@ which tools are permitted.
 
 JSONL lands at `logs/audit.jsonl` (configurable via `AegisConfig.log_path`
 in a later release). If `otlp_endpoint` is set, the same events are also
-emitted as OTLP spans. Every record carries `run_id` — grep by it to
-reconstruct one agent run's full tool-call sequence.
+emitted as OTLP spans.
 
-## Optional: centralising the audit trail
+Every record written by the wrapper — every tool call, every denial — carries
+`run_id`, so grepping one id reconstructs that run's full sequence. The
+`spec_loaded` record is the exception: it carries `run_id` only if you passed
+`run_id=config.run_id` to `load_spec`/`propose_spec`, because those take the
+id as an optional argument rather than reading a config. Pass it and one grep
+returns the whole run, opening record included; omit it and the spec load has
+no id to grep by.
+
+## If you want the audit trail centrally queryable — separate, optional add-on
+
+**You are done. Nothing in this section is needed to use Aegis**, and the
+sections after it do not build on it. Skip it unless the paragraph below
+describes a problem you actually have.
 
 JSONL is the durable record and it is enough for one agent on one machine. It
 does not survive a fleet — the trail ends up scattered across hosts with
-`grep` as the query language.
-
+`grep` as the query language. If that is your situation,
 **[aegis-controlplane](https://github.com/obengbuo/aegis-controlplane)** is a
-self-hosted backend that makes the audit trail centrally queryable: batch
-ingest, bearer auth, a query API, retention with rollups, and a read-only web
-UI, as a Docker Compose stack. The library ships records to it over HTTP via
-three `AegisConfig` fields.
+separately-deployed, self-hosted backend that makes the trail centrally
+queryable: batch ingest, bearer auth, a query API, retention with rollups, and
+a read-only web UI, as a Docker Compose stack. The library ships records to it
+over HTTP via three `AegisConfig` fields, all defaulting to `None`.
 
-It is entirely optional and off by default. Nothing above depends on it,
-nothing about enforcement changes when it is absent, and if it is unreachable
-or misconfigured your tool calls are still evaluated, your decisions are still
-correct, and your records still land in JSONL. The two repositories share no
-code; the only coupling is a POST to `/v1/records`.
+Enforcement never depends on it. With no control plane configured, shipping is
+inert and costs nothing. With one configured and broken, your tool calls are
+still evaluated, your decisions are still correct, and your records still land
+in JSONL. The two repositories share no code; the only coupling is a POST to
+`/v1/records`.
 
-**→ [CONTROL_PLANE.md](CONTROL_PLANE.md)** covers setup, the three config
-fields, the fail-open contract, and two constraints that only apply once a
-control plane is configured: construct `AegisConfig` *before* calling
-`load_spec`/`propose_spec`, and pass `run_id=config.run_id` to the loader.
+**→ [CONTROL_PLANE.md](CONTROL_PLANE.md)** — setup, the three config fields,
+the fail-open contract, and two constraints that exist *only* once a control
+plane is configured, and which you can ignore entirely until then.
 
 ## Configuring your observability layer
 
@@ -327,7 +338,7 @@ you're in a different Python environment than the one you installed into.
 - Check which Python you're using: `python -c "import sys; print(sys.executable)"`
 - Make sure your virtual environment is activated. On Windows PowerShell:
   `.venv\Scripts\Activate.ps1`. On Unix: `source .venv/bin/activate`.
-- Reinstall in the current environment: `pip install --force-reinstall git+https://github.com/obengbuo/aegis.git@v0.1.1`
+- Reinstall in the current environment: `pip install --force-reinstall git+https://github.com/obengbuo/aegis.git@v0.2.0`
 
 ### `Could not resolve authentication method` when calling `propose_spec()`
 

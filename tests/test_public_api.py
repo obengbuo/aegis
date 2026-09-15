@@ -1,5 +1,5 @@
 """
-tests/test_public_api.py — the Waxell integration contract.
+tests/test_public_api.py — the public integration contract.
 
 These tests exercise aegis's public surface exactly as an external
 integrator would: `from aegis import ...`, never aegis.wrapper / aegis.policy
@@ -80,7 +80,7 @@ def _valid_spec_yaml() -> str:
 
 
 def test_all_six_public_symbols_import_successfully():
-    """The exact import statement Waxell's integration doc will use."""
+    """The exact import statement docs/INTEGRATION.md tells integrators to use."""
     assert callable(wrap_toolset)
     assert callable(propose_spec)
     assert callable(load_spec)
@@ -111,7 +111,7 @@ def test_wrap_toolset_mutates_input_toolset():
 
 
 def test_end_to_end_facade_config_spec_and_wrap(tmp_path):
-    """AegisConfig + load_spec + wrap_toolset, exactly as Waxell would chain them.
+    """AegisConfig + load_spec + wrap_toolset, exactly as an integrator chains them.
 
     Uses a hand-authored spec fixture via load_spec rather than propose_spec
     to avoid a live Anthropic call in a unit test.

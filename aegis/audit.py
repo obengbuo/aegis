@@ -6,8 +6,8 @@ Phase 2: this module's interface stays the same, but the backend becomes
 Postgres (RDS). Keep the public functions stable so the swap is painless.
 
 OTLP (Week 5 Stream 2): JSONL is the durable local record; OTLP is an
-additive, best-effort mirror for Waxell's observe layer (Datadog / Jaeger /
-Splunk — all OTLP-compatible). OTLP export failures never raise out of
+additive, best-effort mirror for whatever observability layer the operator
+already runs (Datadog / Jaeger / Splunk — all OTLP-compatible). OTLP export failures never raise out of
 write_record — the same fail-open contract as the rest of this module's
 audit path, deliberately the mirror image of policy evaluation's
 fail-closed contract in wrapper.py. An unreachable collector must never

@@ -88,7 +88,7 @@ _USER_REQUEST = (
 # taking the injection bait on a given run. Only the former is
 # infrastructure noise worth auto-retrying; the latter is a real assertion
 # failure and should still fail loudly. only_rerun scopes reruns to the
-# infrastructure-flake exception types so Waxell's CI doesn't inherit
+# infrastructure-flake exception types so an integrator's CI doesn't inherit
 # Anthropic capacity blips as apparent Aegis test failures, without masking
 # a genuine enforcement regression.
 @pytest.mark.flaky(reruns=3, reruns_delay=2, only_rerun=["ModelHTTPError", "OverloadedError", "APIConnectionError"])

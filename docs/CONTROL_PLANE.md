@@ -178,16 +178,33 @@ the key is a credential for your audit backend.
 
 ## Troubleshooting
 
-### Records aren't arriving and nothing is being logged
+### Records aren't arriving
 
-**A non-2xx response from the control plane currently produces no
-operator-visible output.** Only a transport-level exception (connection
-refused, DNS failure, timeout) prints to stderr. A wrong or revoked API key
-returns `401`, which the shipper treats as a retryable failure and retries
-silently with backoff — so an unauthorised deployment looks exactly like a
-working one from the library's side.
+Check stderr first. Since v0.2.0 the shipper classifies HTTP failures by
+whether retrying could ever help, and reports them:
 
-Check the key directly:
+- **A 4xx is a configuration error** — a bad key, the wrong URL, a batch over
+  the size cap. It cannot succeed as sent, so the batch is reported
+  immediately and not retried. The warning names the status and what to
+  check:
+
+  ```
+  [aegis] control plane rejected a batch: HTTP 401 — invalid or missing API key — check
+          AegisConfig.control_plane_api_key against the control plane's own configuration.
+          This batch will NOT be retried; a 4xx cannot succeed as sent.
+          Its records remain in JSONL, which is the durable record.
+          Shipping continues for later batches; this is reported once.
+  ```
+
+- **A 5xx or a transport error is transient** and keeps retrying with
+  backoff, so a backend restart needs no intervention. These stay quiet
+  until the failure has survived several consecutive attempts, then report
+  once — a blip that resolves on the next try is not an incident.
+
+Either way the report appears **once per distinct failure**, not per retry,
+and the set resets after a success so a later outage is reported again.
+
+To check a key directly without running an agent:
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8100/v1/records \
@@ -213,7 +230,14 @@ You didn't pass `run_id=config.run_id` to the loader. See
 
 ### Records are in JSONL but the centralised count is lower
 
-Expected under sustained backend unavailability: the ship queue is bounded and
-drops oldest. Look for `dropped_since_last_batch` in the backend, and for the
-throttled stderr warning naming the drop count. JSONL retains every record —
-it is the durable copy, and this is the designed trade rather than a bug.
+Two causes, both accounted for rather than silent:
+
+- **Sustained backend unavailability.** The ship queue is bounded and drops
+  oldest, with a throttled stderr warning naming the count.
+- **A batch rejected with a 4xx.** It is abandoned rather than retried, and
+  its records are counted as dropped too.
+
+Either way the gap rides the next successful batch as
+`dropped_since_last_batch`, so the backend sees a hole as a hole rather than
+as silence. JSONL retains every record — it is the durable copy, and this is
+the designed trade rather than a bug.
