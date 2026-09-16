@@ -23,6 +23,42 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from aegis.audit import write_record
 
 
+# ---------------------------------------------------------------------------
+# Argument value classification — what rule 7 is able to reason about.
+#
+# Rule 7 compares str(value) against literal strings. For a scalar that is a
+# faithful, stable rendering of the value. For a container it is a PYTHON
+# REPR, which is not a value any operator wrote down: it made collections
+# effectively unconstrainable, made matching order-dependent, and collapsed
+# types — the literal string "['/s/a.txt']" satisfied a constraint written for
+# the list ['/s/a.txt'].
+#
+# So the value is classified first, and anything the engine cannot reason
+# about is denied. This is the same reasoning as Rule 3's: see
+# docs/CAPABILITY_SPEC.md on why an absent args block means zero-arg rather
+# than any-arg. "Allow any value" is not a default worth inferring.
+_SCALAR_TYPES = (str, int, float, bool, type(None))
+_COLLECTION_TYPES = (list, tuple, set, frozenset)
+
+# Classification outcomes. "collection" means a collection OF SCALARS — one
+# level deep and no deeper, because an element that is itself a container
+# would put str() back in the matching path.
+_ArgKind = Literal["scalar", "collection", "unsupported"]
+
+
+def _classify_arg_value(value: Any) -> _ArgKind:
+    """Classify one argument value. Pure; no I/O. Fails closed by default:
+    a type not named here is "unsupported", so adding a new container type to
+    Python cannot silently widen what a spec permits."""
+    if isinstance(value, _SCALAR_TYPES):
+        return "scalar"
+    if isinstance(value, _COLLECTION_TYPES):
+        if all(isinstance(element, _SCALAR_TYPES) for element in value):
+            return "collection"
+        return "unsupported"
+    return "unsupported"
+
+
 class SpecValidationError(Exception):
     """Raised when a capability spec fails validation at load time.
 
@@ -40,12 +76,35 @@ class ArgSpec(BaseModel):
 
     must_match_one_of: list[str] | None = None
 
+    # Opt out of value checking for this one argument. Defaults to False, and
+    # deliberately has no "safe" default that could be inferred: an argument
+    # whose value is unchecked is a hole in the spec, so saying so has to be a
+    # keystroke the operator typed.
+    #
+    # It exists because rule 7 denies an unconstrained collection (see
+    # _evaluate_capability_rules), which would otherwise leave list-taking
+    # tools unusable rather than merely unconstrainable. Every call permitted
+    # by it carries matched_rule="rule-7-bypassed-allow-any", so the weakening
+    # is greppable in the audit log instead of looking like a clean ALLOW —
+    # the same treatment weak-posture bypasses get.
+    allow_any: bool = False
+
     @field_validator("must_match_one_of")
     @classmethod
     def non_empty_allow_list(cls, v: list[str] | None) -> list[str] | None:
         if v is not None and len(v) == 0:
             raise ValueError("must_match_one_of cannot be an empty list")
         return v
+
+    @model_validator(mode="after")
+    def allow_any_excludes_an_allow_list(self) -> "ArgSpec":
+        if self.allow_any and self.must_match_one_of is not None:
+            raise ValueError(
+                "allow_any and must_match_one_of are mutually exclusive: one says "
+                "any value is permitted, the other names the permitted values. "
+                "Silently preferring either would make the spec misstate what it allows."
+            )
+        return self
 
 
 class ToolSpec(BaseModel):
@@ -255,20 +314,94 @@ def _evaluate_capability_rules(
                 matched_rule="rule-6-extra-arg",
             )
 
-    # Rule 7: value not in allow-list
-    # Both arg_name (spec-controlled) and call_value (attacker-controlled)
-    # are repr()'d so neither can inject newlines into the reason string.
+    # Rule 7: argument values.
+    #
+    # Scalars compare literally against must_match_one_of, as they always
+    # have. Collections compare ELEMENT-WISE — every element must be listed,
+    # which makes a list-valued argument constrainable for the first time and
+    # is order-independent, unlike the old str(value) comparison. Anything the
+    # engine cannot reason about is denied. An unconstrained collection is
+    # denied too: it would permit any value, and unlike a scalar the operator
+    # had no way to say otherwise.
+    #
+    # Both arg_name (spec-controlled) and every value or element
+    # (attacker-controlled) are repr()'d so neither can inject newlines into
+    # the reason string or the JSON audit record.
+    bypassed_allow_any = False
+
     for arg_name, arg_entry in args_spec.items():
-        if arg_entry is not None and arg_entry.must_match_one_of is not None:
-            call_value = str(args[arg_name])
-            if call_value not in arg_entry.must_match_one_of:
+        value = args[arg_name]
+
+        # allow_any: this argument's value is deliberately unchecked. Recorded
+        # below so the call is greppable rather than looking like a clean pass.
+        if arg_entry is not None and arg_entry.allow_any:
+            bypassed_allow_any = True
+            continue
+
+        allow_list = arg_entry.must_match_one_of if arg_entry is not None else None
+        kind = _classify_arg_value(value)
+
+        if kind == "unsupported":
+            return Decision(
+                verdict="DENY",
+                reason=(
+                    f"arg {arg_name!r} has type {type(value).__name__!r}, which a "
+                    f"capability spec cannot express a literal constraint for; "
+                    f"set allow_any on this arg to permit it explicitly"
+                ),
+                matched_rule="rule-7-unsupported-arg-type",
+            )
+
+        if kind == "collection":
+            if allow_list is None:
                 return Decision(
                     verdict="DENY",
-                    reason=f"arg {arg_name!r} value {call_value!r} not in capability spec",
-                    matched_rule="rule-7-value-not-allowed",
+                    reason=(
+                        f"arg {arg_name!r} is a collection with no must_match_one_of; "
+                        f"leaving it unconstrained would permit any value. List the "
+                        f"permitted elements, or set allow_any to say so explicitly"
+                    ),
+                    matched_rule="rule-7-unconstrained-collection",
                 )
+            if len(value) == 0:
+                return Decision(
+                    verdict="DENY",
+                    reason=(
+                        f"arg {arg_name!r} is an empty collection; it matches nothing "
+                        f"in the capability spec, and some tools read an empty "
+                        f"collection as 'all'"
+                    ),
+                    matched_rule="rule-7-empty-collection",
+                )
+            for element in value:
+                if str(element) not in allow_list:
+                    return Decision(
+                        verdict="DENY",
+                        reason=(
+                            f"arg {arg_name!r} element {str(element)!r} "
+                            f"not in capability spec"
+                        ),
+                        matched_rule="rule-7-value-not-allowed",
+                    )
+            continue
 
-    # Rule 8: all checks pass
+        # scalar
+        if allow_list is not None and str(value) not in allow_list:
+            return Decision(
+                verdict="DENY",
+                reason=f"arg {arg_name!r} value {str(value)!r} not in capability spec",
+                matched_rule="rule-7-value-not-allowed",
+            )
+
+    # Rule 8: all checks pass. A clean ALLOW earns matched_rule=None; an ALLOW
+    # that only passed because a value check was waived says which waiver,
+    # exactly as the weak-posture bypasses above do.
+    if bypassed_allow_any:
+        return Decision(
+            verdict="ALLOW",
+            reason="all checks passed",
+            matched_rule="rule-7-bypassed-allow-any",
+        )
     return Decision(verdict="ALLOW", reason="all checks passed", matched_rule=None)
 
 

@@ -812,3 +812,242 @@ def test_load_spec_no_audit_record_on_yaml_parse_error(tmp_path, temp_log):
     with pytest.raises(SpecValidationError, match="parse error"):
         load_spec(f)
     assert not temp_log.exists() or temp_log.read_text().strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# Rule 7 — ARGUMENT VALUE TYPES.
+#
+# Rule 7 used to compare str(value) against the literal allow-list. Sound for
+# a scalar; for anything else it compared a Python repr, which meant:
+#
+#   * an UNCONSTRAINED non-scalar was permitted outright — a spec entry of
+#     `paths: null` on read_multiple_files allowed
+#     ["C:/Windows/System32/config/SAM"];
+#   * a collection could not be constrained in any usable way (listing the
+#     elements denied every call; listing str(the list) worked but was
+#     order-dependent);
+#   * types collapsed — the literal STRING "['/s/a.txt']" satisfied a
+#     constraint written for the LIST ['/s/a.txt'].
+#
+# docs/CAPABILITY_SPEC.md claims literal matching makes the bypass surface
+# zero. These tests are what make that claim true rather than aspirational.
+#
+# The table below is the specification, and DENY is its default: a value
+# shape added to it without matching handling in evaluate() fails. That is
+# the point — it catches the class, not the one reported instance.
+# ---------------------------------------------------------------------------
+
+
+def _arg_spec(entry) -> CapabilitySpec:
+    """filesystem/read with a single arg 'a' whose spec entry is `entry`."""
+    return _spec({"filesystem": {"tools": {"read": {"args": {"a": entry}}}}})
+
+
+def _d(entry, value) -> Decision:
+    return evaluate(_arg_spec(entry), "filesystem", "read", {"a": value})
+
+
+class _Exotic:
+    """A type nobody enumerated, whose __str__ mimics an allowed value."""
+
+    def __str__(self) -> str:
+        return "/sandbox/a.txt"
+
+
+# Every shape that is not a scalar.
+_NON_SCALAR = [
+    pytest.param(["/sandbox/a.txt"], id="list-one"),
+    pytest.param(["/sandbox/a.txt", "/sandbox/b.txt"], id="list-many"),
+    pytest.param([], id="list-empty"),
+    pytest.param(("/sandbox/a.txt",), id="tuple"),
+    pytest.param({"/sandbox/a.txt"}, id="set"),
+    pytest.param(frozenset({"/sandbox/a.txt"}), id="frozenset"),
+    pytest.param({"path": "/sandbox/a.txt"}, id="dict"),
+    pytest.param({}, id="dict-empty"),
+    pytest.param([["/sandbox/a.txt"]], id="nested-list"),
+    pytest.param([{"path": "/sandbox/a.txt"}], id="list-of-dict"),
+    pytest.param(b"/sandbox/a.txt", id="bytes"),
+    pytest.param(bytearray(b"/sandbox/a.txt"), id="bytearray"),
+    pytest.param(_Exotic(), id="exotic-object"),
+]
+
+_ALLOWED_ELEMENTS = {"must_match_one_of": ["/sandbox/a.txt", "/sandbox/b.txt"]}
+
+
+# --- the class: an unconstrained arg must never admit a non-scalar ----------
+
+
+@pytest.mark.parametrize("value", _NON_SCALAR)
+def test_unconstrained_arg_never_allows_a_non_scalar(value):
+    """THE CLASS TEST. `a: null` means "any value" only for scalars. For
+    anything else the operator could not have expressed a constraint, so
+    permitting it is a silent bypass; fail closed instead."""
+    d = _d(None, value)
+    assert d.verdict == "DENY", f"{type(value).__name__} was ALLOWed unconstrained"
+    assert d.matched_rule is not None
+
+
+@pytest.mark.parametrize("value", _NON_SCALAR)
+def test_empty_constraint_block_never_allows_a_non_scalar(value):
+    """`a: {}` is the other way to say "no constraint named" and must behave
+    identically — otherwise the bypass just moves one key over."""
+    d = _d({}, value)
+    assert d.verdict == "DENY", f"{type(value).__name__} was ALLOWed with an empty ArgSpec"
+
+
+@pytest.mark.parametrize("value", _NON_SCALAR)
+def test_a_constraint_is_never_satisfied_by_the_repr_of_a_non_scalar(value):
+    """Kills the str() collapse: a constraint listing the value's own repr
+    must not admit it. This is what let a string impersonate a list."""
+    d = _d({"must_match_one_of": [str(value)]}, value)
+    assert d.verdict != "ALLOW", (
+        f"{type(value).__name__} matched a constraint containing its own repr"
+    )
+
+
+def test_a_string_cannot_impersonate_a_list():
+    """The type-confusion case stated directly. A constraint written for the
+    list ['/sandbox/a.txt'] must not be satisfied by the string that happens
+    to render identically."""
+    entry = {"must_match_one_of": ["/sandbox/a.txt"]}
+    assert _d(entry, ["/sandbox/a.txt"]).verdict == "ALLOW"    # the list: intended
+    assert _d(entry, "['/sandbox/a.txt']").verdict == "DENY"   # the string: not
+
+
+# --- the reported instance -------------------------------------------------
+
+
+def test_unconstrained_list_arg_does_not_permit_an_arbitrary_path():
+    """The reported bypass, verbatim: an operator whose agent batches into
+    read_multiple_files adds the tool, cannot constrain the list, leaves it
+    unconstrained, and has silently removed path scoping for that tool."""
+    spec = _spec({
+        "filesystem": {"tools": {"read_multiple_files": {"args": {"paths": None}}}}
+    })
+    d = evaluate(spec, "filesystem", "read_multiple_files",
+                 {"paths": ["C:/Windows/System32/config/SAM"]})
+    assert d.verdict == "DENY"
+    assert d.matched_rule == "rule-7-unconstrained-collection"
+
+
+# --- B: collections become constrainable ------------------------------------
+
+
+def test_collection_allowed_when_every_element_is_listed():
+    _assert_allow(_d(_ALLOWED_ELEMENTS, ["/sandbox/a.txt"]))
+    _assert_allow(_d(_ALLOWED_ELEMENTS, ["/sandbox/a.txt", "/sandbox/b.txt"]))
+    _assert_allow(_d(_ALLOWED_ELEMENTS, ("/sandbox/b.txt",)))
+
+
+def test_collection_denied_when_any_element_is_unlisted():
+    d = _d(_ALLOWED_ELEMENTS, ["/sandbox/a.txt", "/etc/shadow"])
+    assert d.verdict == "DENY"
+    assert d.matched_rule == "rule-7-value-not-allowed"
+    assert "/etc/shadow" in d.reason, "the reason must name the offending element"
+
+
+def test_collection_matching_is_order_independent():
+    """Element-wise membership, not repr comparison — so the same set of
+    files passes in any order. The old str(list) behaviour did not."""
+    _assert_allow(_d(_ALLOWED_ELEMENTS, ["/sandbox/a.txt", "/sandbox/b.txt"]))
+    _assert_allow(_d(_ALLOWED_ELEMENTS, ["/sandbox/b.txt", "/sandbox/a.txt"]))
+
+
+def test_empty_collection_is_denied_explicitly():
+    """[] satisfies "every element is listed" vacuously. Some tools read an
+    empty list as "all", so deny rather than reason about whether the no-op
+    is harmless."""
+    d = _d(_ALLOWED_ELEMENTS, [])
+    assert d.verdict == "DENY"
+    assert d.matched_rule == "rule-7-empty-collection"
+
+
+def test_nested_collection_is_denied_even_when_constrained():
+    d = _d(_ALLOWED_ELEMENTS, [["/sandbox/a.txt"]])
+    assert d.verdict == "DENY"
+    assert d.matched_rule == "rule-7-unsupported-arg-type"
+
+
+def test_mapping_is_denied_even_when_constrained():
+    d = _d(_ALLOWED_ELEMENTS, {"path": "/sandbox/a.txt"})
+    assert d.verdict == "DENY"
+    assert d.matched_rule == "rule-7-unsupported-arg-type"
+
+
+def test_exotic_type_whose_str_matches_is_still_denied():
+    """Exhaustiveness probe: _Exotic.__str__ returns an allowed value. A type
+    the classifier does not know must not be admitted on the strength of its
+    __str__."""
+    d = _d(_ALLOWED_ELEMENTS, _Exotic())
+    assert d.verdict == "DENY"
+    assert d.matched_rule == "rule-7-unsupported-arg-type"
+
+
+# --- A: scalars are untouched ----------------------------------------------
+
+
+def test_scalar_behaviour_is_unchanged():
+    """Part A of the fix is "change nothing for scalars"; pin that."""
+    _assert_allow(_d(_ALLOWED_ELEMENTS, "/sandbox/a.txt"))
+    assert _d(_ALLOWED_ELEMENTS, "/sandbox/evil.txt").matched_rule == "rule-7-value-not-allowed"
+    _assert_allow(_d(None, "anything at all"))      # unconstrained scalar: still ALLOW
+    _assert_allow(_d(None, ""))
+    _assert_allow(_d(None, 0))
+    _assert_allow(_d(None, False))
+    _assert_allow(_d(None, None))
+
+
+# --- D: the explicit, greppable escape hatch --------------------------------
+
+
+@pytest.mark.parametrize("value", _NON_SCALAR)
+def test_allow_any_permits_any_shape_but_names_itself(value):
+    """allow_any keeps list-taking tools usable after C. The difference from
+    the bug is that it is explicit in the spec and greppable in the audit
+    log, following the rule-N-bypassed-* idiom already used for weak
+    posture."""
+    d = _d({"allow_any": True}, value)
+    assert d.verdict == "ALLOW"
+    assert d.matched_rule == "rule-7-bypassed-allow-any", (
+        "an allow_any bypass must not masquerade as an enforcement-passed ALLOW"
+    )
+
+
+def test_allow_any_is_not_the_default():
+    """Defaulting to allow_any would preserve the vulnerability silently,
+    which is the entire bug."""
+    from aegis.policy import ArgSpec
+
+    assert ArgSpec().allow_any is False
+    assert ArgSpec(must_match_one_of=["/sandbox/a.txt"]).allow_any is False
+
+
+def test_allow_any_does_not_excuse_a_missing_or_extra_arg():
+    """allow_any relaxes the VALUE check only. Rule 5 still requires the arg
+    to be present, and rule 6 still rejects unlisted args."""
+    spec = _arg_spec({"allow_any": True})
+    assert evaluate(spec, "filesystem", "read", {}).matched_rule == "rule-5-missing-required-arg"
+    assert evaluate(
+        spec, "filesystem", "read", {"a": ["x"], "b": "y"}
+    ).matched_rule == "rule-6-extra-arg"
+
+
+def test_allow_any_with_must_match_one_of_is_rejected():
+    """The two are contradictory: one says "any value", the other names the
+    permitted values. Silently preferring either would make a spec lie about
+    what it permits."""
+    with pytest.raises(Exception):
+        _arg_spec({"allow_any": True, "must_match_one_of": ["/sandbox/a.txt"]})
+
+
+# --- reason-string safety, same contract as rules 5/6/7 ---------------------
+
+
+def test_collection_denial_reason_repr_escapes_attacker_controlled_elements():
+    """Elements come from the tool call and are attacker-controlled, so they
+    are repr()'d before reaching the reason string or the JSON audit record —
+    the same defence rules 6 and 7 already apply to scalar values."""
+    d = _d(_ALLOWED_ELEMENTS, ["/sandbox/a.txt", "evil\nstatus: ok"])
+    assert d.verdict == "DENY"
+    assert "\n" not in d.reason
+    assert "\\n" in d.reason

@@ -514,3 +514,73 @@ def test_wrapper_raises_aegis_approval_required_when_no_callback(temp_log):
     records = [json.loads(line) for line in temp_log.read_text().splitlines()]
     assert len(records) == 1
     assert records[0]["status"] == "intercepted"
+
+
+# ---------------------------------------------------------------------------
+# Bypass ALLOWs must be greppable in the audit log.
+#
+# docs/CAPABILITY_SPEC.md says of a non-None matched_rule on an ALLOW:
+#
+#   "A non-None value here makes these bypass events greppable in the audit
+#    log, distinct from enforcement-passed ALLOWs that earned their None."
+#
+# That was not true: the wrapper wrote matched_rule onto denied / intercepted
+# records only, so every bypass ALLOW — weak posture, and now allow_any —
+# reached the log indistinguishable from a call that passed every check.
+# An operator who unconstrained one argument had no signal anywhere.
+# ---------------------------------------------------------------------------
+
+
+def _ok_record(temp_log) -> dict:
+    records = [json.loads(line) for line in temp_log.read_text().splitlines()]
+    ok = [r for r in records if r["status"] == "ok"]
+    assert len(ok) == 1, f"expected one ok record, got {[r['status'] for r in records]}"
+    return ok[0]
+
+
+async def _echo(tool_name, args):
+    return "file contents"
+
+
+def test_clean_allow_records_no_matched_rule(temp_log):
+    """The baseline: a call that passed every check earns a None, and the
+    key is absent rather than present-and-null, so a query for
+    `matched_rule is not null` returns only real bypasses."""
+    hook = wrapper.make_process_tool_call("filesystem", spec=_allow_spec())
+    asyncio.run(hook(FakeCtx(), _echo, "read_text_file", {"path": "/sandbox/notes.txt"}))
+
+    assert "matched_rule" not in _ok_record(temp_log)
+
+
+def test_allow_any_bypass_is_recorded_on_the_ok_record(temp_log):
+    """The visibility half of the allow_any fix. Permitting an unconstrained
+    collection is a deliberate posture choice; every call made under it says
+    so in the durable record."""
+    spec = CapabilitySpec.model_validate({
+        "task": "batch read",
+        "servers": {"filesystem": {"tools": {
+            "read_multiple_files": {"args": {"paths": {"allow_any": True}}}}}},
+        "spec_hash": "allowanyhash",
+    })
+    hook = wrapper.make_process_tool_call("filesystem", spec=spec)
+    asyncio.run(hook(FakeCtx(), _echo, "read_multiple_files", {"paths": ["/sandbox/a.txt"]}))
+
+    # NOTE: ok records do not carry spec_hash today — only denials do. Not
+    # asserted here, and not added: no consumer has asked for it. See
+    # docs/OPEN_QUESTIONS.md on not adding record fields speculatively.
+    assert _ok_record(temp_log)["matched_rule"] == "rule-7-bypassed-allow-any"
+
+
+def test_weak_posture_bypass_is_recorded_on_the_ok_record(temp_log):
+    """The same gap, pre-existing: deny_all_others=false ALLOWs an unlisted
+    tool and the Decision has always said so, but the record never did."""
+    spec = CapabilitySpec.model_validate({
+        "task": "loose spec, deny_all_others=false",
+        "deny_all_others": False,
+        "servers": {"filesystem": {"tools": {"read_text_file": None}}},
+        "spec_hash": "weakhash",
+    })
+    hook = wrapper.make_process_tool_call("filesystem", spec=spec)
+    asyncio.run(hook(FakeCtx(), _echo, "some_unlisted_tool", {"anything": "goes"}))
+
+    assert _ok_record(temp_log)["matched_rule"] == "rule-2-bypassed-weak-posture"

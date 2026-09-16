@@ -196,6 +196,16 @@ async def _process(
     # "approved after intercept" apart from a straight ALLOW.
     approved_after_intercept = False
 
+    # Non-None only on a BYPASS ALLOW — a call permitted because a check was
+    # waived (weak posture, or allow_any on an argument) rather than because
+    # it passed. Carried onto the ok/error record: docs/CAPABILITY_SPEC.md
+    # promises these are "greppable in the audit log, distinct from
+    # enforcement-passed ALLOWs that earned their None", and until this was
+    # threaded through, they were not — the Decision said so and the record
+    # dropped it, so an operator who unconstrained one argument got no signal
+    # anywhere.
+    allow_matched_rule: str | None = None
+
     # Phase 2: policy enforcement — skipped when no spec is provided
     if spec is not None:
         try:
@@ -244,6 +254,12 @@ async def _process(
                 raise AegisApprovalRequired(server_name, tool_name, args, decision)
         # ALLOW, or an INTERCEPT approved above, falls through to the call below
 
+        # Only a genuine ALLOW contributes here. An approved INTERCEPT is
+        # already flagged by `intercepted`, and reusing this field for it
+        # would conflate "a check was waived" with "an operator said yes".
+        if decision.verdict == "ALLOW":
+            allow_matched_rule = decision.matched_rule
+
     try:
         result = await call_tool(tool_name, args)
     except Exception as exc:  # noqa: BLE001 - we re-raise after logging
@@ -255,6 +271,8 @@ async def _process(
         }
         if approved_after_intercept:
             error_record["intercepted"] = True
+        if allow_matched_rule is not None:
+            error_record["matched_rule"] = allow_matched_rule
         write_record(error_record, otlp_endpoint=otlp_endpoint)
         raise
 
@@ -307,6 +325,8 @@ async def _process(
     }
     if approved_after_intercept:
         ok_record["intercepted"] = True
+    if allow_matched_rule is not None:
+        ok_record["matched_rule"] = allow_matched_rule
     write_record(ok_record, otlp_endpoint=otlp_endpoint)
     return result
 

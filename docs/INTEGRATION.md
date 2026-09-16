@@ -225,32 +225,48 @@ tool, which rule 2 then denies:
 ```
 
 This is the designed loop, not a bug: the denial is safe, it is in the audit
-log, and the operator adds the missing tool. But be aware of two things before
-you reflexively add it.
+log, and the operator adds the missing tool. Adding it is straightforward, but
+a list-valued argument is constrained differently from a scalar one.
 
-First, **you cannot meaningfully constrain a list-valued argument.** Rule 7
-compares `str(value)`, so for a `paths` list it compares the stringified list.
-Listing the individual files denies every call; listing the stringified list
-"works" but is order-sensitive and absurd:
+**List-valued arguments match element-wise.** `must_match_one_of` lists the
+permitted *elements*, and the call is allowed only if every element in it is
+listed. Order does not matter:
 
 ```python
-{"paths": {"must_match_one_of": ["C:/s/a.txt", "C:/s/b.txt"]}}  # -> always DENY
-{"paths": {"must_match_one_of": [str(["C:/s/a.txt", "C:/s/b.txt"])]}}
-    # -> ALLOW for that exact order, DENY if the agent reorders the same files
+{"read_multiple_files": {"args": {"paths": {"must_match_one_of": [
+    "C:/s/a.txt",
+    "C:/s/b.txt",
+]}}}}
+# ALLOW  ["C:/s/a.txt"]                 - subset
+# ALLOW  ["C:/s/b.txt", "C:/s/a.txt"]   - any order
+# DENY   ["C:/s/a.txt", "/etc/shadow"]  - rule-7-value-not-allowed
+# DENY   []                             - rule-7-empty-collection
 ```
 
-Second, the only practical way to permit such a tool today is to leave its
-argument unconstrained — **which permits any path at all**, including outside
-the sandbox:
+**Do not leave a list-valued argument unconstrained.** Aegis denies it rather
+than permitting any value, because unlike a scalar there would be no way for
+you to have said otherwise:
 
 ```python
 {"read_multiple_files": {"args": {"paths": None}}}
-# ALLOW for the intended files -- and ALLOW for ["C:/Windows/System32/config/SAM"]
+# DENY  rule-7-unconstrained-collection
 ```
 
-Until list-valued arguments can be constrained, prefer keeping requests to one
-file per call, or pre-author the spec with `load_spec` so you control exactly
-which tools are permitted.
+If you genuinely need an unchecked argument, say so explicitly with
+`allow_any`. It waives the value check for that one argument, and every call
+it permits is recorded with `matched_rule="rule-7-bypassed-allow-any"` so the
+waiver is greppable in the audit log rather than looking like a clean pass:
+
+```python
+{"read_multiple_files": {"args": {"paths": {"allow_any": True}}}}
+# ALLOW  rule-7-bypassed-allow-any  - for ANY paths, including outside the sandbox
+```
+
+Reach for that last one only when you mean it. A `dict`-valued or nested
+argument is denied outright (`rule-7-unsupported-arg-type`) unless waived the
+same way — the spec format cannot express a literal constraint for those
+shapes, so the engine refuses to guess. See
+[CAPABILITY_SPEC.md](CAPABILITY_SPEC.md) for the full table.
 
 ## Reading the audit log
 

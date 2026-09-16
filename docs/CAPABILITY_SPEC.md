@@ -48,12 +48,27 @@ servers:
             # Optional. If present: the argument value must equal one of
             # these strings exactly (literal match, v1 — no globs, no regex).
             # If absent: the argument must be present in the call but its
-            # value is unconstrained.
+            # value is unconstrained (SCALAR values only — see below).
             must_match_one_of:
               - "<literal_value_1>"
               - "<literal_value_2>"
+          <list_valued_arg_name>:
+            # A LIST-valued argument (e.g. read_multiple_files' `paths`) is
+            # matched ELEMENT-WISE: the call is allowed only if every element
+            # is listed here. Order does not matter. An empty list is DENIED.
+            must_match_one_of:
+              - "<literal_element_1>"
+              - "<literal_element_2>"
           <unconstrained_arg_name>: ~
           # ~ (YAML null) means: arg must be present, any value is allowed.
+          # This applies to SCALAR values only. A list-valued argument left
+          # unconstrained is DENIED (rule-7-unconstrained-collection) — see
+          # "Argument value types" below.
+          <deliberately_unchecked_arg>:
+            # Waives value checking for this one argument, whatever its type.
+            # Mutually exclusive with must_match_one_of. Every call permitted
+            # by it records matched_rule="rule-7-bypassed-allow-any".
+            allow_any: true
 ```
 
 ---
@@ -120,8 +135,13 @@ An argument is present in both the call and the spec, and the spec has
   - On a normal ALLOW (all rules passed): `None`.
   - **On a weak-posture ALLOW** (server or tool not listed, `deny_all_others:
     false`): `"rule-1-bypassed-weak-posture"` or `"rule-2-bypassed-weak-posture"`.
+  - **On an `allow_any` ALLOW**: `"rule-7-bypassed-allow-any"`.
     A non-`None` value here makes these bypass events greppable in the audit log,
-    distinct from enforcement-passed ALLOWs that earned their `None`.
+    distinct from enforcement-passed ALLOWs that earned their `None`. The
+    wrapper copies it onto the `ok` (and `error`) record for exactly that
+    reason; a clean ALLOW omits the key entirely, so querying for records where
+    `matched_rule` is present returns every denial and every waiver and nothing
+    else.
   - On INTERCEPT: `"rule-9-intercept-required"`.
 
 ### Rule 5 / Rule 6 ordering rationale
@@ -162,8 +182,15 @@ args block present
 ```
 
 The v1 cost: specs must be verbose. Every arg the agent will ever pass must
-appear in the spec, even optional ones. This is an intentional trade — bypass
-surface is zero; spec maintenance cost is explicit and visible.
+appear in the spec, even optional ones. This is an intentional trade — the
+pattern-bypass surface is zero; spec maintenance cost is explicit and visible.
+
+"Zero" is a claim about *pattern* bypasses — the glob and regex class described
+under "Why literal-only argument matching in v1". It is not a claim that no
+spec can be written permissively. A spec can still waive a check: with
+`deny_all_others: false`, or with `allow_any: true` on an argument. Both are
+explicit in the spec and both stamp a `matched_rule` on every call they permit,
+so a waiver is a recorded decision rather than an invisible gap.
 
 ### The "spec is silent on this case" table
 
@@ -172,7 +199,10 @@ surface is zero; spec maintenance cost is explicit and visible.
 | Server not in `servers:`                    | DENY    |
 | Tool not in `tools:`                        | DENY    |
 | Arg in call not in `args:` block            | DENY    |
-| Arg in spec with no `must_match_one_of`     | value unconstrained; ALLOW on any value |
+| Arg in spec with no `must_match_one_of`, scalar value | value unconstrained; ALLOW on any value |
+| Arg in spec with no `must_match_one_of`, list value  | DENY (`rule-7-unconstrained-collection`) |
+| Arg whose value is a dict, nested list, or any other non-scalar | DENY (`rule-7-unsupported-arg-type`) |
+| Arg with `allow_any: true`                  | ALLOW on any value, recorded as `rule-7-bypassed-allow-any` |
 | Tool listed with no `args:` block           | ALLOW only if call has zero args |
 
 ---
@@ -545,6 +575,45 @@ leave unconstrained). Zero-args is the safer default and matches the only real
 use case for an absent block: tools that genuinely take no arguments. Tools
 that accept arguments must have an explicit args block, making the spec
 self-documenting.
+
+### Argument value types — why non-scalars are handled separately
+
+Rule 7 compares `str(value)` against the literal allow-list. For a scalar that
+is a faithful, stable rendering of the value. For a container it is a *Python
+repr*, which is not a value any operator wrote down, and three things followed
+from that:
+
+- An **unconstrained** container was permitted outright. A spec entry of
+  `paths: ~` on a batch reader allowed `["C:/Windows/System32/config/SAM"]`.
+- A container could not be constrained in any usable way. Listing the elements
+  denied every call (the repr of a list never equals one element); listing
+  `str(the list)` worked but was order-dependent and absurd to write.
+- **Types collapsed.** The literal string `"['/s/a.txt']"` satisfied a
+  constraint written for the list `['/s/a.txt']`, so a string argument could
+  impersonate a list.
+
+The last two made the first one *reachable by following reasonable advice*: an
+operator whose agent batched into `read_multiple_files` would add the tool,
+find the list unconstrainable, leave it unconstrained, and silently lose path
+scoping for that tool while every other entry still looked tightly scoped.
+
+So values are classified before they are matched:
+
+| Value | Constrained by `must_match_one_of` | Unconstrained |
+|---|---|---|
+| Scalar (`str`, `int`, `float`, `bool`, `None`) | exact match, as before | ALLOW (any value) |
+| Collection of scalars (`list`, `tuple`, `set`, `frozenset`) | every element must be listed; order-independent; empty DENIED | **DENY** `rule-7-unconstrained-collection` |
+| Anything else (`dict`, nested list, `bytes`, arbitrary object) | **DENY** `rule-7-unsupported-arg-type` | **DENY** `rule-7-unsupported-arg-type` |
+
+Denying the unconstrained collection is the same reasoning as Rule 3's, one
+level down: "allow any value" is not a default worth inferring from silence.
+The classifier fails closed, so a value shape nobody enumerated cannot be
+permitted on the strength of its `__str__`.
+
+`allow_any: true` is the escape hatch, because denying unconstrained
+collections would otherwise leave list-taking tools unusable rather than merely
+unconstrainable. It differs from the bug in the two ways that matter: it is
+explicit in the spec, and every call it permits is labelled in the audit log.
 
 ### Why literal-only argument matching in v1
 
