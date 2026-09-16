@@ -228,6 +228,240 @@ mismatch.
 
 ----
 
+## The audit log records tool content verbatim, including credentials
+
+**RESOLVED 2026-09-16 — do not re-open.** Both exits are closed, and the two
+found while fixing them with it. Redaction is now independent of
+`response_inspection_mode`: that setting governs detection output and refusal,
+recording is always redacted. Four fields are scanned before being written —
+`result_preview`, each argument value, a denial's `reason`, and an `error`
+message — and what is scanned is the already-truncated text, because only the
+truncated text can reach the log. That caps the cost at 500 characters per
+response and 1000 per argument, which is what made scanning unconditionally
+affordable; a full-response scan for callers who never asked for inspection
+would not have been.
+
+The `reason` exit does not go through `_safe_args`: `aegis/policy.py` builds
+that string from the raw args dict, so redacting arguments does not cover it.
+It is redacted in `aegis/wrapper.py` instead, which keeps all audit redaction
+at one seam and keeps the enforcement path free of any scanner import.
+
+`off` still means no `response_pattern_detected` record and nothing refused.
+Injecting a new record type into every existing deployment's audit stream would
+have been a behavioural change nobody asked for, which is why changing the
+default to `warn` was rejected. Because there is no detection record to point
+at in that case, the preview notice names the mode and how to get details
+instead of naming a record that does not exist.
+
+Verified against a live run rather than reasoned about — a real Haiku agent, a
+real filesystem MCP server, default config, reading a file containing a real
+private key:
+
+```
+mode: off (the default)
+  spec_loaded  preview='-'
+  ok           preview='[redacted: response preview matched a sensitive-data pattern. response_i'
+
+  whole audit file contains 'BEGIN RSA PRIVATE KEY': False
+  whole audit file contains the key body           : False
+
+  agent still received the file contents (not modified by Aegis):
+    Based on the content, this is an **RSA private key file**.
+```
+
+Deliberately unchanged: a `PermissionError` raised to the caller still names
+the rejected value. The caller supplied it, and a denial message that hides the
+value is not diagnosable. Aegis redacts what Aegis writes.
+
+A test at `tests/test_response_inspection.py` asserted the SSN was present in
+`result_preview` under `off`, pinning the leak as intended behaviour. It was
+inverted deliberately and its comment now states what it pins instead.
+
+
+**The question.** Every successful tool call records a `result_preview` — 500
+characters of the tool's response — and every call records its arguments,
+truncated at 1000 characters each. Neither is redacted unless response
+inspection is enabled, and `AegisConfig.response_inspection_mode` defaults to
+`"off"`. So in the shipped configuration a credential returned by a tool, or
+passed to one, is written to `logs/audit.jsonl` in plain text.
+
+This is logged as one entry rather than two because it is one defect with two
+exits. Splitting them would let the worse exit hide behind the fix for the
+milder one.
+
+**How it surfaced.** While verifying MCP01's claim in
+`docs/OWASP_MCP_TOP10.md` that "Aegis never writes matched secrets into its own
+audit records". The redaction path is real and works — but only when inspection
+is on, which it is not by default:
+
+```
+status=ok  mode=off (the default)
+result_preview = '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA_real_key_material_her'
+*** raw private key material in the audit record: True
+```
+
+The full behaviour, verified across every mode and match tier:
+
+| mode | response content | `ok` record | `result_preview` |
+|---|---|---|---|
+| `off` (default) | block-tier match | written | **raw** |
+| `off` (default) | warn-tier match | written | **raw** |
+| `warn` | any match | written | redacted |
+| `block` | block-tier match | none — call refused | n/a |
+| `block` | warn-tier match | written | redacted |
+| any | no match | written | raw (correct — nothing matched) |
+
+The redaction machinery is complete. It simply never runs at the default.
+
+**The second exit, which is worse.** `_safe_args` in `aegis/wrapper.py`
+truncates argument values and does not redact them — its own comment says "NOTE
+for Phase 2: this is also where PII redaction will live." Response inspection
+only ever scans responses, so an argument is logged verbatim in **every** mode,
+including `block`:
+
+```
+  mode=block block-secret-in-args   records=['ok']
+        raw in preview: False    raw in args: True
+```
+
+An agent calling `write_file(content=<private key>)` writes that key to the
+audit log no matter how response inspection is configured. This exit is not
+default-dependent, which makes it the more exposed of the two.
+
+**Why the default is the wrong one.** A security product whose default
+configuration writes the secrets it exists to protect into a plaintext file on
+disk has the default backwards. The audit log is also the artifact most likely
+to be shipped elsewhere — to a control plane, to an OTLP collector, into a
+support ticket — so the blast radius is wider than one file.
+
+**What redaction would cost.** `result_preview` has no programmatic consumer:
+it is absent from `_OTLP_ATTRIBUTE_MAP`, unread by `audit.query` and
+`audit.summary`, and referenced only in tests. Its purpose is human debugging.
+Redacting it on a match costs a preview of exactly those responses that should
+not have been stored, and leaves the clean-response case — nearly all traffic —
+untouched.
+
+**Candidate directions:**
+- Redact unconditionally: run the scanner purely to decide what is *recorded*,
+  while `response_inspection_mode` continues to govern only what is *refused*.
+  Separates "what do I record" from "what do I refuse". Cost is a scan on every
+  response; largely avoidable by scanning only the 500-character preview rather
+  than the whole response, since only the preview can leak.
+- Change the default to `warn`. One line, but it conflates recording with
+  refusing, writes a new record type into every existing deployment's audit
+  stream, and runs a full-response scan for everyone.
+- Hash the preview, or omit it unless explicitly enabled. Destroys the
+  debugging value for all responses rather than the risky ones.
+- Truncate more aggressively. Does not help: a private key header is
+  identifiable in its first 31 characters.
+
+**Trigger.** Before any design partner runs Aegis against a credentialed MCP
+server — GitHub, Postgres, a cloud API — which is where the risk actually
+lives, and which `docs/OPEN_QUESTIONS.md` §4 already lists as untested ground.
+
+**Do not** re-introduce a mode-dependent recording path. Detection output and
+refusal are configurable; what reaches the audit log is not.
+
+---
+
+## Server fingerprinting is unreachable from the installed package
+
+**The question.** `aegis/fingerprint.py` hashes an MCP server's advertised tool
+surface — names, descriptions, input schemas — stores a baseline, and reports
+added, removed, and modified tools against it. The module works. Nothing an
+integrator installs ever calls it.
+
+**How it surfaced.** While verifying MCP03's claim in
+`docs/OWASP_MCP_TOP10.md` that drift is recomputed on every run and raises an
+alert before the agent executes.
+
+```
+=== callers of fingerprint functions ===
+./aegis/wrapper.py:192:    note_server_seen(server_name)
+./agents/stack.py:58:        result = check_server(name, tools)
+
+agents/ present in site-packages: False
+```
+
+`check_server()` has exactly one caller, `agents/stack.py`, and
+`pyproject.toml` has `include = ["aegis*"]`, so `agents/` is not packaged. An
+integrator following `docs/INTEGRATION.md` gets no drift detection at all.
+What `wrap_toolset` does call is `note_server_seen()`, which adds a name to
+`_seen_this_session` — a module-level set that nothing reads.
+
+**Four separate gaps, not one.**
+1. Not wired: no code path in the installed package reaches `check_server()`.
+2. No alerting: `check_server()` returns a dict for its caller to inspect. It
+   writes no audit record, raises nothing, and blocks nothing. `agents/stack.py`
+   prints to stdout.
+3. Baseline overwritten on drift (`aegis/fingerprint.py:109`), so a change is
+   reported once and the next run reports `unchanged`. The one signal is
+   consumed by the act of observing it.
+4. No tests: no file under `tests/` references fingerprinting.
+
+**Impact.** MCP03 coverage rests entirely on the capability spec constraining
+what a poisoned tool can *do* — which is real, and is what the mapping now
+claims. The supply-chain-integrity story that `fingerprint.py`'s own docstring
+describes is not in effect for anyone.
+
+**Candidate directions, none chosen:**
+- Call `check_server()` from `wrap_toolset` and write an audit record on drift.
+  Requires the toolset to be connected, since it needs `list_tools()` — so it
+  belongs in the startup path rather than the per-call hook.
+- Decide whether drift should block. Fail-closed is the house default, but a
+  drifted description with an unchanged spec cannot widen what a tool may
+  receive, so blocking may be the wrong severity.
+- Require explicit baseline approval instead of auto-updating, so drift stays
+  visible until acknowledged.
+- Package `agents/` too. Rejected: it is the development stack, not product.
+
+**Trigger.** Before making any public claim that Aegis addresses MCP supply
+chain or tool poisoning through drift detection. Tracked as a roadmap item in
+`README.md`. Nobody is currently relying on it, which is the only reason this
+is a question rather than an incident.
+
+---
+
+## The SSN detector's dummy-data window suppresses real matches
+
+**The question.** `_scan_ssn` skips any `NNN-NN-NNNN` match with `test`,
+`dummy`, or `example` within 20 characters, to avoid firing on fixture data.
+The window is content-blind, so an unrelated token containing one of those
+words suppresses a real SSN sitting beside it.
+
+**How it surfaced.** A probe written to check MCP01's redacted-preview examples
+returned only the AWS key from a response containing both:
+
+```
+response: "key: AKIAIOSFODNN7EXAMPLE and ssn 123-45-6789"
+patterns matched: [aws_access_key]        <- SSN absent
+```
+
+`AKIAIOSFODNN7EXAMPLE` — the canonical AWS documentation key — contains
+`EXAMPLE`, which fell inside the SSN's 20-character window and suppressed it.
+
+**Impact.** Low but real, and it fails open rather than closed, which is the
+wrong direction for a detector. The suppression is silent: no record says a
+match was discarded. Any response that legitimately contains one of the three
+markers near a real SSN loses the detection.
+
+**Candidate directions, none chosen:**
+- Require the marker to be adjacent to the match rather than within 20
+  characters, or require it to be a whole word.
+- Require the marker to precede the match, on the theory that a label comes
+  before its value.
+- Drop the heuristic and accept fixture-data false positives, on the grounds
+  that a detector that silently discards matches is worse than a noisy one.
+- Record suppressed matches at a third tier below `warn`, so the decision is
+  visible rather than invisible.
+
+**Trigger.** Deferred. Revisit if a real deployment reports a missed SSN, or
+alongside the pattern-configurability work (`response_inspection_pattern_verdicts`)
+that `aegis/response_inspection.py` already names as a v2 knob — the exclusion
+window is the same kind of per-pattern tuning.
+
+---
+
 ## Revision log
 
 - **Week 7** — First version. Four questions logged with explicit triggers.
@@ -242,3 +476,16 @@ mismatch.
   Logged `unshipped_before_configure` above as a paired change. The loader
   still takes a bare `run_id` and still has no dependency on `config.py` —
   the coupling added runs config → shipper, the other direction.
+- **2026-09-16** — Logged three code issues found while verifying
+  `docs/OWASP_MCP_TOP10.md` against the implementation: the audit log
+  recording tool content verbatim (two exits — `result_preview` at the
+  default, and `args` in every mode), fingerprinting being unreachable from
+  the installed package, and the SSN detector's dummy-data window suppressing
+  real matches. The first is being fixed now; the other two are deferred with
+  triggers.
+- **2026-09-16** — Fixed the audit-log exit above. Verifying it turned up two
+  more paths than the two originally reported: a denial's `reason`, built in
+  `policy.py` from the raw args and so not covered by redacting arguments, and
+  a tool exception's `error` text. All four are redacted at one seam in
+  `wrapper.py`, independently of `response_inspection_mode`. Fingerprinting and
+  the SSN window remain open with their triggers.

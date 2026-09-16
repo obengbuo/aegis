@@ -214,7 +214,7 @@ async def _process(
             write_record({
                 **base_record,
                 "status": "policy_evaluation_error",
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": _safe_error(f"{type(exc).__name__}: {exc}"),
                 "spec_hash": spec.spec_hash,
             }, otlp_endpoint=otlp_endpoint)
             raise PermissionError("policy evaluation failed") from exc
@@ -223,7 +223,7 @@ async def _process(
             write_record({
                 **base_record,
                 "status": "denied",
-                "reason": decision.reason,
+                "reason": _safe_reason(decision.reason),
                 "matched_rule": decision.matched_rule,
                 "spec_hash": spec.spec_hash,
             }, otlp_endpoint=otlp_endpoint)
@@ -233,7 +233,7 @@ async def _process(
             write_record({
                 **base_record,
                 "status": "intercepted",
-                "reason": decision.reason,
+                "reason": _safe_reason(decision.reason),
                 "matched_rule": decision.matched_rule,
                 "spec_hash": spec.spec_hash,
             }, otlp_endpoint=otlp_endpoint)
@@ -244,7 +244,7 @@ async def _process(
                     write_record({
                         **base_record,
                         "status": "denied_after_intercept",
-                        "reason": "operator declined intercepted call",
+                        "reason": _safe_reason("operator declined intercepted call"),
                         "matched_rule": "rule-9-intercept-denied-by-operator",
                         "spec_hash": spec.spec_hash,
                     }, otlp_endpoint=otlp_endpoint)
@@ -267,7 +267,7 @@ async def _process(
             **base_record,
             "status": "error",
             "latency_ms": round((time.monotonic() - started) * 1000, 1),
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": _safe_error(f"{type(exc).__name__}: {exc}"),
         }
         if approved_after_intercept:
             error_record["intercepted"] = True
@@ -316,11 +316,17 @@ async def _process(
         # here — the audit log must not become the leak it just detected.
         # The response_pattern_detected record above already carries
         # redacted previews via PatternMatch.match_repr.
+        # Three cases, deliberately distinct:
+        #   a match was detected  -> point at the detection record
+        #   inspection enabled, clean -> the full response was already scanned
+        #                                clean, so the preview is clean too
+        #   inspection off        -> scan the preview itself before recording it
         "result_preview": (
-            "[redacted: response matched a sensitive-data pattern — "
-            "see the response_pattern_detected record for this call_id]"
+            _REDACTED_PREVIEW_DETECTED
             if response_had_matches
             else _preview(result)
+            if response_inspection_mode != "off"
+            else _safe_preview(result)
         ),
     }
     if approved_after_intercept:
@@ -331,19 +337,104 @@ async def _process(
     return result
 
 
-def _safe_args(args: dict[str, Any]) -> dict[str, Any]:
-    """Truncate oversized argument values so the audit log stays readable.
+# ---------------------------------------------------------------------------
+# Audit-log redaction.
+#
+# The audit log must not become the leak that response inspection exists to
+# prevent. Four fields written here can carry agent- or tool-supplied content:
+# result_preview, each argument value, a denial's reason, and an error message.
+# All four used to carry it verbatim, and only the first was ever redacted —
+# and only when response inspection was enabled, which it is not by default.
+#
+# Redaction is therefore independent of response_inspection_mode. That setting
+# governs DETECTION OUTPUT (whether a response_pattern_detected record is
+# written) and REFUSAL (whether a response is withheld). It does not govern
+# what gets recorded. An operator who chose "block" was still getting
+# credentials on disk through the other three fields, because response
+# inspection only ever scanned responses.
+#
+# What is scanned is always the already-TRUNCATED text, never the full value.
+# Only the truncated text can reach the log, so a secret past the truncation
+# point was never going to be recorded and costs nothing to ignore. That caps
+# this at 500 characters per response and 1000 per argument, which is why
+# scanning unconditionally is affordable.
+#
+# See "The audit log records tool content verbatim" in docs/OPEN_QUESTIONS.md.
+# ---------------------------------------------------------------------------
 
-    NOTE for Phase 2: this is also where PII redaction will live.
+_REDACTED_PREVIEW_DETECTED = (
+    "[redacted: response matched a sensitive-data pattern — "
+    "see the response_pattern_detected record for this call_id]"
+)
+# Used when inspection is off: there is no detection record to point at, so the
+# notice says why and how to get one instead of naming a record that is absent.
+_REDACTED_PREVIEW_UNSCANNED = (
+    "[redacted: response preview matched a sensitive-data pattern. "
+    'response_inspection_mode is "off", so no detection record was written — '
+    'set it to "warn" or "block" for pattern details]'
+)
+_REDACTED_ARG = "[redacted: argument value matched a sensitive-data pattern]"
+_REDACTED_REASON = (
+    "[redacted: denial reason contained a sensitive-data pattern — "
+    "see matched_rule for the rule that fired]"
+)
+_REDACTED_ERROR = "[redacted: error message contained a sensitive-data pattern]"
+
+
+def _contains_sensitive(text: str) -> bool:
+    """True when text matches any response-inspection pattern.
+
+    The same deterministic scanner response inspection uses — regex and Luhn,
+    no I/O, no LLM — called here purely to decide what is RECORDED. Callers
+    pass the already-truncated string.
+    """
+    return scan_response(text, {}).verdict != "clean"
+
+
+def _safe_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Truncate oversized argument values, then redact any that look like a
+    credential.
+
+    Redaction is per-value, not per-record: a secret in one argument must not
+    blind an investigator to the others.
     """
     safe: dict[str, Any] = {}
     for key, value in args.items():
         text = str(value)
-        safe[key] = text if len(text) <= 1000 else text[:1000] + "...[truncated]"
+        if len(text) > 1000:
+            text = text[:1000] + "...[truncated]"
+        safe[key] = _REDACTED_ARG if _contains_sensitive(text) else text
     return safe
+
+
+def _safe_reason(reason: str) -> str:
+    """Redact a decision reason that carries a credential.
+
+    Rule 7 embeds the rejected argument value in its reason, and the rejected
+    value is exactly the thing most likely to be a credential the agent should
+    not have been passing. That reason is built in aegis/policy.py from the RAW
+    args dict, not from _safe_args, so redacting arguments does not cover it —
+    it has to happen here. matched_rule is a sibling field and survives, so the
+    denial stays diagnosable.
+    """
+    return _REDACTED_REASON if _contains_sensitive(reason) else reason
+
+
+def _safe_error(text: str) -> str:
+    """Redact an error message that carries a credential. An upstream server
+    that echoes the offending value back in its error text would otherwise put
+    it in the log, whatever the mode."""
+    return _REDACTED_ERROR if _contains_sensitive(text) else text
 
 
 def _preview(result: Any, limit: int = 500) -> str:
     """Short, log-friendly preview of a tool result."""
     text = str(result)
     return text if len(text) <= limit else text[:limit] + "...[truncated]"
+
+
+def _safe_preview(result: Any) -> str:
+    """The preview as it will be recorded, redacted if it looks like a
+    credential. Scans the truncated preview only — see the module notes."""
+    preview = _preview(result)
+    return _REDACTED_PREVIEW_UNSCANNED if _contains_sensitive(preview) else preview

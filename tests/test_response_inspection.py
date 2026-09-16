@@ -17,6 +17,7 @@ from pydantic_ai.mcp import MCPToolset
 
 from aegis import audit, wrapper
 from aegis.config import AegisConfig
+from aegis.policy import CapabilitySpec
 from aegis.response_inspection import scan_response
 
 
@@ -143,7 +144,15 @@ def _wrapped_toolset(server_name: str, config: AegisConfig | None = None) -> MCP
 
 def test_wrapper_response_inspection_off_by_default(temp_log, tmp_path):
     """No config at all, and a config with mode='off' explicitly — neither
-    scans; the response returns untouched and no detection record appears."""
+    blocks; the response returns untouched and no detection record appears.
+
+    `off` suppresses detection OUTPUT, not redaction. It used to suppress both,
+    which meant the shipped default wrote credential material into the audit
+    log verbatim — see "The audit log records tool content verbatim" in
+    docs/OPEN_QUESTIONS.md. The preview is now redacted in every mode; what
+    `off` still means is that no response_pattern_detected record is written
+    and nothing is ever refused.
+    """
     async def fake_call_tool(tool_name, args):
         return "Customer SSN: 123-45-6789"
 
@@ -159,7 +168,10 @@ def test_wrapper_response_inspection_off_by_default(temp_log, tmp_path):
     records = [json.loads(line) for line in temp_log.read_text().splitlines()]
     assert len(records) == 1
     assert records[0]["status"] == "ok"
-    assert "123-45-6789" in records[0]["result_preview"]  # no scan ran, nothing redacted
+    # INVERTED, deliberately: this line used to assert the SSN was present,
+    # pinning the leak as intended behaviour. What it pins now is that `off`
+    # governs detection output and refusal, not what reaches the log.
+    assert "123-45-6789" not in records[0]["result_preview"]
 
     # Explicit config with mode="off" — same behavior.
     config = AegisConfig(sandbox_root=tmp_path, response_inspection_mode="off")
@@ -253,3 +265,265 @@ def test_wrapper_response_inspection_block_only_blocks_block_tier(temp_log, tmp_
     # seeing verdict="warn" cannot know block mode was even in force; with both,
     # it's unambiguous that nothing was withheld.
     assert detected["response_inspection_mode"] == "block"
+
+
+# ---------------------------------------------------------------------------
+# AUDIT-LOG REDACTION.
+#
+# Aegis writes four free-text fields that can carry agent- or tool-supplied
+# content, and all four used to carry it verbatim:
+#
+#   result_preview  500 chars of the response      leaked at the default only
+#   args            1000 chars per argument        leaked in EVERY mode
+#   reason          a denial's explanation         leaked in EVERY mode
+#   error           a tool exception's message     leaked in EVERY mode
+#
+# The last three are not mode-dependent: an operator who read the docs,
+# understood the risk and chose `block` still got the secret on disk. And the
+# reason is built in aegis/policy.py from the RAW args dict, not from
+# _safe_args, so fixing the argument path does not cover it.
+#
+# All four are now scanned before they are written. What is scanned is the
+# TRUNCATED text, because only the truncated text can reach the log — a secret
+# past the truncation point was never going to be recorded. Detection output
+# and refusal remain governed by response_inspection_mode; recording does not.
+#
+# See "The audit log records tool content verbatim" in docs/OPEN_QUESTIONS.md.
+# ---------------------------------------------------------------------------
+
+_KEY = "-----BEGIN RSA PRIVATE KEY-----MIIEowIBAAKCAQEAreal_key_material"
+_SSN_TEXT = "Customer SSN: 123-45-6789"
+
+_ALL_MODES = ["off", "warn", "block"]
+
+
+def _spec_for(tool: str, arg: str, permitted: list[str] | None = None):
+    """A spec permitting fs/<tool> with one argument, optionally constrained."""
+    from aegis.policy import CapabilitySpec
+
+    entry = {"must_match_one_of": permitted} if permitted else None
+    return CapabilitySpec.model_validate({
+        "task": "t",
+        "servers": {"fs": {"tools": {tool: {"args": {arg: entry}}}}},
+        "spec_hash": "REDACTHASH",
+    })
+
+
+def _records(temp_log) -> list[dict]:
+    return [json.loads(line) for line in temp_log.read_text().splitlines()]
+
+
+def _only(temp_log, status: str) -> dict:
+    hits = [r for r in _records(temp_log) if r["status"] == status]
+    assert len(hits) == 1, f"expected one {status}; got {[r['status'] for r in _records(temp_log)]}"
+    return hits[0]
+
+
+# --- result_preview: the default-dependent exit -----------------------------
+
+
+@pytest.mark.parametrize("payload", [_KEY, _SSN_TEXT], ids=["block-tier", "warn-tier"])
+def test_preview_is_redacted_with_inspection_off(temp_log, payload):
+    """THE REGRESSION TEST. mode defaults to off; the preview must still not
+    carry credential material."""
+    async def tool(name, args):
+        return payload
+
+    hook = wrapper.make_process_tool_call("fs", spec=_spec_for("read", "path"))
+    result = asyncio.run(hook(FakeCtx(), tool, "read", {"path": "/x"}))
+
+    # The response itself is never modified — that contract is unchanged.
+    assert result == payload
+
+    record = _only(temp_log, "ok")
+    assert "PRIVATE KEY" not in record["result_preview"]
+    assert "123-45-6789" not in record["result_preview"]
+    assert "[redacted" in record["result_preview"]
+    # ...and the notice points somewhere useful, since with inspection off
+    # there is no response_pattern_detected record to point at.
+    assert "response_inspection_mode" in record["result_preview"]
+    # off still means no detection output.
+    assert [r["status"] for r in _records(temp_log)] == ["ok"]
+
+
+def test_clean_response_preview_is_untouched_in_every_mode(temp_log, tmp_path):
+    """Redaction must not cost the preview on ordinary traffic, which is
+    nearly all of it."""
+    body = "just some ordinary file contents, nothing sensitive here"
+
+    async def tool(name, args):
+        return body
+
+    for i, mode in enumerate(_ALL_MODES):
+        hook = wrapper.make_process_tool_call(
+            "fs", spec=_spec_for("read", "path"), response_inspection_mode=mode)
+        asyncio.run(hook(FakeCtx(), tool, "read", {"path": f"/x{i}"}))
+
+    previews = [r["result_preview"] for r in _records(temp_log) if r["status"] == "ok"]
+    assert len(previews) == 3
+    assert all(p == body for p in previews), previews
+
+
+def test_only_the_recorded_preview_is_scanned(temp_log):
+    """A secret past the 500-character truncation point never reaches the log,
+    so it must not trigger redaction of a preview that is genuinely clean.
+    This is what keeps the scan cheap: 500 characters, not the whole response.
+    """
+    async def tool(name, args):
+        return ("x" * 600) + _KEY
+
+    hook = wrapper.make_process_tool_call("fs", spec=_spec_for("read", "path"))
+    asyncio.run(hook(FakeCtx(), tool, "read", {"path": "/x"}))
+
+    preview = _only(temp_log, "ok")["result_preview"]
+    assert "PRIVATE KEY" not in preview       # never recorded in the first place
+    assert "[redacted" not in preview         # and so not redacted either
+    assert preview.startswith("xxx")
+
+
+# --- args: leaked in every mode --------------------------------------------
+
+
+@pytest.mark.parametrize("mode", _ALL_MODES)
+def test_argument_value_is_redacted_in_every_mode(temp_log, mode):
+    """Not default-dependent: response inspection never scanned arguments, so
+    `block` leaked exactly as much as `off`."""
+    async def tool(name, args):
+        return "written"
+
+    hook = wrapper.make_process_tool_call(
+        "fs", spec=_spec_for("write", "content"), response_inspection_mode=mode)
+    asyncio.run(hook(FakeCtx(), tool, "write", {"content": _KEY}))
+
+    record = _only(temp_log, "ok")
+    assert "PRIVATE KEY" not in json.dumps(record["args"])
+    assert "[redacted" in record["args"]["content"]
+
+
+def test_only_the_offending_argument_is_redacted(temp_log):
+    """Per-value, not per-record: a secret in one argument must not blind an
+    investigator to the others."""
+    async def tool(name, args):
+        return "written"
+
+    spec = CapabilitySpec.model_validate({
+        "task": "t",
+        "servers": {"fs": {"tools": {"write": {"args": {"path": None, "content": None}}}}},
+        "spec_hash": "H",
+    })
+    hook = wrapper.make_process_tool_call("fs", spec=spec)
+    asyncio.run(hook(FakeCtx(), tool, "write", {"path": "/sandbox/out.txt", "content": _KEY}))
+
+    args = _only(temp_log, "ok")["args"]
+    assert args["path"] == "/sandbox/out.txt"      # untouched
+    assert "[redacted" in args["content"]
+
+
+# --- reason: built in policy.py, so the args fix cannot cover it ------------
+
+
+@pytest.mark.parametrize("mode", _ALL_MODES)
+def test_denial_reason_is_redacted_in_every_mode(temp_log, mode):
+    """Rule 7's reason embeds the rejected value. The value is the thing that
+    was rejected, so it is exactly the thing most likely to be a credential
+    the agent should not have been passing."""
+    async def tool(name, args):
+        raise AssertionError("must never be called")
+
+    hook = wrapper.make_process_tool_call(
+        "fs", spec=_spec_for("write", "content", ["benign"]),
+        response_inspection_mode=mode)
+    with pytest.raises(PermissionError):
+        asyncio.run(hook(FakeCtx(), tool, "write", {"content": _KEY}))
+
+    record = _only(temp_log, "denied")
+    assert "PRIVATE KEY" not in record["reason"]
+    assert "[redacted" in record["reason"]
+    assert "PRIVATE KEY" not in json.dumps(record["args"])
+    # matched_rule survives, so the denial is still diagnosable.
+    assert record["matched_rule"] == "rule-7-value-not-allowed"
+
+
+def test_ordinary_denial_reason_is_untouched(temp_log):
+    """Redaction must not cost the reason on ordinary denials."""
+    async def tool(name, args):
+        raise AssertionError("must never be called")
+
+    hook = wrapper.make_process_tool_call("fs", spec=_spec_for("write", "content", ["benign"]))
+    with pytest.raises(PermissionError):
+        asyncio.run(hook(FakeCtx(), tool, "write", {"content": "/etc/passwd"}))
+
+    reason = _only(temp_log, "denied")["reason"]
+    assert "/etc/passwd" in reason
+    assert "[redacted" not in reason
+
+
+def test_collection_element_denial_reason_is_redacted(temp_log):
+    """The element-wise branch of rule 7 embeds the offending element."""
+    async def tool(name, args):
+        raise AssertionError("must never be called")
+
+    hook = wrapper.make_process_tool_call("fs", spec=_spec_for("batch", "items", ["benign"]))
+    with pytest.raises(PermissionError):
+        asyncio.run(hook(FakeCtx(), tool, "batch", {"items": [_KEY]}))
+
+    record = _only(temp_log, "denied")
+    assert "PRIVATE KEY" not in record["reason"]
+    assert "[redacted" in record["reason"]
+
+
+# --- error: a tool exception's own message ----------------------------------
+
+
+@pytest.mark.parametrize("mode", _ALL_MODES)
+def test_tool_exception_message_is_redacted_in_every_mode(temp_log, mode):
+    """An upstream server that echoes the offending value back in its error
+    text would otherwise put it in the log, whatever the mode."""
+    async def tool(name, args):
+        raise RuntimeError(f"upstream rejected {_KEY}")
+
+    hook = wrapper.make_process_tool_call(
+        "fs", spec=_spec_for("write", "content"), response_inspection_mode=mode)
+    with pytest.raises(RuntimeError):
+        asyncio.run(hook(FakeCtx(), tool, "write", {"content": "benign"}))
+
+    record = _only(temp_log, "error")
+    assert "PRIVATE KEY" not in record["error"]
+    assert "[redacted" in record["error"]
+
+
+def test_ordinary_tool_error_is_untouched(temp_log):
+    async def tool(name, args):
+        raise FileNotFoundError("no such file: /sandbox/missing.txt")
+
+    hook = wrapper.make_process_tool_call("fs", spec=_spec_for("write", "content"))
+    with pytest.raises(FileNotFoundError):
+        asyncio.run(hook(FakeCtx(), tool, "write", {"content": "benign"}))
+
+    error = _only(temp_log, "error")["error"]
+    assert "missing.txt" in error
+    assert "[redacted" not in error
+
+
+# --- the enabled modes are unchanged ---------------------------------------
+
+
+def test_warn_mode_still_writes_a_detection_record_and_points_at_it(temp_log, tmp_path):
+    """Regression guard: the recording change must not alter what the enabled
+    modes do. warn still detects, still returns, and its preview notice still
+    points at the detection record rather than at the mode."""
+    async def tool(name, args):
+        return _SSN_TEXT
+
+    config = AegisConfig(sandbox_root=tmp_path, response_inspection_mode="warn")
+    toolset = _wrapped_toolset("fs", config=config)
+    result = asyncio.run(
+        toolset.process_tool_call(FakeCtx(), tool, "read_text_file", {"path": "/x"}))
+
+    assert result == _SSN_TEXT
+    statuses = [r["status"] for r in _records(temp_log)]
+    assert "response_pattern_detected" in statuses
+
+    preview = _only(temp_log, "ok")["result_preview"]
+    assert "123-45-6789" not in preview
+    assert "response_pattern_detected" in preview

@@ -81,18 +81,36 @@ window is content-blind, so an unrelated token containing one of those words —
 `AKIAIOSFODNN7EXAMPLE`, for instance — will suppress a real SSN that happens to
 sit beside it. A deliberate false-positive trade, and a real detection gap.
 
-**What reaches the audit log.** When response inspection is enabled, a detection
-records a redacted preview and never the matched value: `'XXX-XX-1234'` for an
-SSN, `'AKIA...MPLE'` for an access key. The allowed call's own record has its
-response preview replaced with a pointer to the detection record, so the audit
-trail does not become the leak.
+**What reaches the audit log — in every mode, including the default.** Aegis
+writes four fields that can carry agent- or tool-supplied content, and all four
+are scanned before they are written, independently of
+`response_inspection_mode`:
 
-**With response inspection off — the default — none of that applies.** Every
-successful tool call records a `result_preview` of the response, truncated at 500
-characters and otherwise verbatim. A private key returned by a tool lands in
-`logs/audit.jsonl` in plain text. If tool responses in your environment may
-contain credentials, the audit log is in scope for secret handling and you should
-set `response_inspection_mode` accordingly.
+| Field | Redacted when it matches |
+|---|---|
+| `result_preview` (500 chars of the response) | yes |
+| each argument value (1000 chars each) | yes, per value — the others stay readable |
+| a denial's `reason`, which embeds the rejected value | yes; `matched_rule` survives, so the denial stays diagnosable |
+| an `error` message from the tool | yes |
+
+`response_inspection_mode` governs **detection output** — whether a
+`response_pattern_detected` record is written — and **refusal**, whether a
+response is withheld from the model. It does not govern what gets recorded.
+Recording is always redacted, because the audit log must not become the leak
+that this category is about.
+
+Where a detection record exists, it carries a redacted preview and never the
+matched value: `'XXX-XX-1234'` for an SSN, `'AKIA...MPLE'` for an access key.
+
+Only the text that would actually be recorded is scanned — the truncated
+preview, not the whole response — so a credential past the truncation point was
+never going to be logged and costs nothing to check. Clean content is recorded
+verbatim, which is nearly all traffic.
+
+**The boundary is what Aegis writes.** A `PermissionError` raised back to the
+caller still names the rejected argument value, because the caller supplied it
+and a denial message that hides the value is not diagnosable. If your own
+framework logs exceptions, that is your log's scope, not Aegis's.
 
 (One cosmetic note, in case you see it in a record: the AWS-secret preview's
 leading characters are taken from the start of the 40-character candidate window,
@@ -436,10 +454,11 @@ permits it. This is scoping at the ingress point rather than isolation within th
 context window.
 
 Response inspection can provide a second boundary: credential-shaped content in a
-tool response can be blocked before it enters context. It is off by default — see
-MCP01 for the patterns, the tiers, and what the audit log records in each mode.
-With it off, a tool response that enters context is also previewed into
-`logs/audit.jsonl`, raw, up to 500 characters.
+tool response can be blocked before it enters context. It is off by default, so
+by default nothing is withheld from the model — see MCP01 for the patterns and
+the tiers. What the audit log records is redacted in every mode, including the
+default, so a response that does reach context is not additionally exposed on
+disk.
 
 **What it does not do.** Aegis has no visibility into the context window itself. It
 does not isolate, partition, or expire context; it does not prevent information
