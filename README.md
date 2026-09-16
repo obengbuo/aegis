@@ -85,21 +85,33 @@ aegis/               The library. This is what pip installs.
   policy.py            Deterministic capability evaluator
   proposer.py          LLM-based spec proposer (runs once, upfront)
   audit.py             Structured audit log with OTLP export
-  fingerprint.py       MCP server supply-chain integrity
+  fingerprint.py       MCP server tool-surface hashing (not yet wired in; see Roadmap)
   config.py            AegisConfig public API surface
   response_inspection.py    Deterministic response scanning
 
 docs/                User-facing documentation
-tests/               95 unit + integration tests
+tests/               218 unit + integration tests
 \`\`\`
 
 ---
 
 ## Roadmap
 
-Next up: expanded threat detection patterns, container image, additional
-MCP server-specific integrations. Contribution welcome once the API
-surface stabilizes — expected around v0.2.
+**Wire server fingerprinting into the enforcement path.** `aegis/fingerprint.py`
+hashes a server's advertised tool surface (names, descriptions, input schemas)
+and compares it against a stored baseline, but `check_server()` is called only
+from `agents/stack.py` — the development test stack, which `pip` does not
+install. An integrator following [docs/INTEGRATION.md](docs/INTEGRATION.md)
+therefore gets no drift detection. Wiring it into `wrap_toolset`, emitting an
+audit record on drift, and deciding whether drift should block a run are open
+work. Two known limitations to resolve at the same time: a detected drift
+currently overwrites the stored baseline, so the change is reported once and
+the next run reports "unchanged"; and there are no tests.
+
+Also next: expanded threat-detection patterns, a container image, additional
+MCP server-specific integrations, and a hash chain over the audit record
+sequence for tamper-evidence. Contributions welcome — the public API surface
+(`from aegis import ...`) is stable as of v0.2.0.
 
 ---
 
