@@ -188,6 +188,26 @@ async def _process(
         "args": _safe_args(args),
     }
 
+    # The policy that governed this call, on EVERY record derived from
+    # base_record rather than only on the refusals.
+    #
+    # It used to be set at each deny site, so an ALLOW carried no spec_hash
+    # at all - not null, absent. That made "every call is recorded against
+    # the policy that decided it" true only of denials, and it cost two
+    # things a reader would not expect. A control plane query filtered by
+    # spec_hash returned that policy's refusals and silently omitted
+    # everything it permitted, which is the opposite of a decision history.
+    # And a record lifted out of the log on its own - pasted into a ticket,
+    # an incident timeline - could prove a refusal happened under a named
+    # policy but never that an action was permitted under one, because the
+    # join back through the run's spec_loaded record only exists while the
+    # whole run is intact.
+    #
+    # Absent when spec is None, which is Phase 1 log-only mode: no policy
+    # governed the call, so there is no hash to claim one did.
+    if spec is not None:
+        base_record["spec_hash"] = spec.spec_hash
+
     # Phase 1: note that we've seen this server (feeds fingerprinting)
     note_server_seen(server_name)
 

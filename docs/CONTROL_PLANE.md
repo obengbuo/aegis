@@ -157,6 +157,13 @@ sound, but it is a deduction, not a link — and it is knowably ambiguous when
 the same spec was loaded twice before a run, in which case the backend returns
 both candidates rather than picking one.
 
+The inference needs at least one of the run's records to carry a `spec_hash`.
+Every record a wrapped call writes now does, so it holds for any run with a
+tool call in it. Before that change only denials carried the hash, and a run
+that was permitted end to end — the ordinary case, and most of a healthy
+deployment's traffic — fell through to `no_spec_hash_on_this_run` and showed
+no spec at all.
+
 Both loaders take a bare `run_id` string rather than the whole config, on
 purpose: neither has any dependency on `AegisConfig`.
 

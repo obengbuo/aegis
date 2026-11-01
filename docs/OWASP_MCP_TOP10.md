@@ -368,19 +368,26 @@ uniform, and the variation is deliberate:
 | `server` | tool-call records and server start/teardown records |
 | `tool`, `args` | tool-call records only |
 | `matched_rule` | every denial, intercept, and waiver — absent on a clean allow |
-| `spec_hash` | denials, intercepts, policy-evaluation errors, and `spec_loaded` |
+| `spec_hash` | every record a wrapped call writes — `ok`, `error`, denials, intercepts, policy-evaluation errors — and `spec_loaded`. Absent only in Phase 1 log-only mode, where no spec governed the call |
 | `latency_ms` | `ok` and `error` only — a denied call never executed, so there is no duration to report |
 | `proposer_prompt_hash` | the proposer's own records (`spec_loaded` when proposed, clarification requests, validation failures) — never a per-call record |
 
 Three properties beyond basic logging:
 
-- **Provenance.** Denial and intercept records carry the SHA-256 hash of the
-  capability spec that produced them. Allowed calls are attributed through the
-  run's `spec_loaded` record, which carries the same hash and — when the spec was
-  LLM-generated — the hash of the prompt version that produced it. An
-  investigator can establish which policy version made a given decision months
-  later, following `run_id` to the opening record, without relying on deployment
-  records. The chain is per-run, not per-record.
+- **Provenance.** Every record a wrapped call writes carries the SHA-256 hash
+  of the capability spec that governed it — the calls it permitted as well as
+  the ones it refused. So a query for one `spec_hash` returns that policy's
+  whole decision history rather than the part of it that said no, and a single
+  record lifted out of the log into a ticket evidences the policy on its own.
+  The `spec_loaded` record carries the same hash and — when the spec was
+  LLM-generated — the hash of the prompt version that produced it, so the
+  policy text itself is still reachable from any one record by way of
+  `run_id`. The chain is per-record for the hash and per-run for the spec
+  behind it.
+
+  Until the fix recorded in [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md), `ok` and
+  `error` records carried no `spec_hash` at all — not null, absent — and
+  attribution for a permitted call was a join away rather than in hand.
 - **Correlation.** Every record the wrapper writes shares a run identifier, so a
   run can be reconstructed in order. The `spec_loaded` record joins that run by
   exact match only if the caller passed `run_id` to `load_spec`/`propose_spec`,

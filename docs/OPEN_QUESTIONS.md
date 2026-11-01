@@ -158,6 +158,20 @@ needs, rather than continuing to discover them one backend caveat at a time.
   parameter; omitted → the record is unchanged from before. Chosen as a bare
   `run_id` string rather than the whole `AegisConfig` so the loader stays free
   of any dependency on `config.py`. See CONTROL_PLANE_DESIGN.md §7.
+- `spec_hash` on `ok` and `error` records — **DONE**. It was written at each
+  deny site, so a permitted call carried no hash at all: not null, absent.
+  Two consequences, both found from outside the library. A control plane
+  query filtered by `spec_hash` returned that policy's **denials only** and
+  silently omitted everything it permitted, which is the opposite of the
+  decision history the filter reads as. And `_find_spec_loaded`'s inference
+  path, whose docstring already asserted that "every record a wrapped tool
+  call writes carries the spec_hash of the spec governing it", fell through
+  to `no_spec_hash_on_this_run` for any run that was permitted end to end —
+  the ordinary case. The hash now goes on `base_record`, so every record
+  derived from it carries it, and it is absent only in Phase 1 log-only mode,
+  where no spec governed the call and claiming one would be a lie. Found
+  while building a reference environment's audit view; see
+  `aegis-reference-env/OPEN_QUESTIONS.md` entry 6.
 
 **Paired change, waiting on the control plane.**
 - `unshipped_before_configure: N` in the *batch envelope* (alongside
@@ -183,7 +197,16 @@ several caveats in one release.
 
 **Trigger.** Do the pass when a *third* control-plane caveat traces back to a
 missing library field — two is coincidence, three is a pattern worth an hour of
-systematic review. Until then, keep fixing them as concrete needs surface.
+systematic review.
+
+**The trigger has fired.** `spec_hash` on allow records is the third, and it
+is the one that should settle the argument: the first two were fields a
+backend route wanted, while this one was a field whose absence made a backend
+docstring and a published table both false, and nobody noticed from inside the
+library. The pass is now due, and the thing to look for is not "what else
+might a consumer want" — that is the speculation this section rightly warns
+against — but "which claims about these records are already written down, and
+which of them are untrue".
 
 **Do not** add record fields no control-plane route actually consumes yet.
 

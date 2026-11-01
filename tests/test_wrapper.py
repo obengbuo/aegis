@@ -287,6 +287,110 @@ def test_wrapper_denied_audit_record_contains_spec_hash(temp_log):
     assert records[0]["spec_hash"] == "deadbeef1234"
 
 
+def test_allowed_call_records_spec_hash(temp_log):
+    """An ALLOW carries the hash of the policy that permitted it.
+
+    It used to carry nothing: spec_hash was written at each deny site, so a
+    permitted call left no trace of which policy permitted it. Two things
+    broke quietly as a result - a control plane query filtered by spec_hash
+    returned refusals only, and a record read on its own could evidence a
+    refusal under a named policy but never a permission under one.
+    """
+    spec = _allow_spec(spec_hash="deadbeef1234")
+
+    async def fake_call_tool(tool_name, args):
+        return "file contents"
+
+    hook = wrapper.make_process_tool_call("filesystem", spec=spec)
+
+    async def run():
+        return await hook(FakeCtx(), fake_call_tool, "read_text_file",
+                          {"path": "/sandbox/notes.txt"})
+
+    asyncio.run(run())
+
+    records = [json.loads(line) for line in temp_log.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["status"] == "ok"
+    assert records[0]["spec_hash"] == "deadbeef1234", (
+        "an allowed call must record the policy that allowed it, or "
+        "spec_hash selects a policy's denials rather than its decisions"
+    )
+
+
+def test_errored_call_records_spec_hash(temp_log):
+    """A permitted call whose tool then throws is still attributable.
+
+    This is the case where attribution matters most and was missing: the
+    policy let the call through and the call did damage.
+    """
+    spec = _allow_spec(spec_hash="deadbeef1234")
+
+    async def failing_call_tool(tool_name, args):
+        raise ValueError("boom")
+
+    hook = wrapper.make_process_tool_call("filesystem", spec=spec)
+
+    async def run():
+        return await hook(FakeCtx(), failing_call_tool, "read_text_file",
+                          {"path": "/sandbox/notes.txt"})
+
+    with pytest.raises(ValueError, match="boom"):
+        asyncio.run(run())
+
+    records = [json.loads(line) for line in temp_log.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["status"] == "error"
+    assert records[0]["spec_hash"] == "deadbeef1234"
+
+
+def test_every_record_of_one_run_carries_the_same_spec_hash(temp_log):
+    """Allow, deny and error under one spec are selected by one filter.
+
+    The property the field exists for: `spec_hash == X` is a policy's whole
+    decision history, not the part of it that said no.
+    """
+    spec = _allow_spec(spec_hash="deadbeef1234")
+
+    async def ok_call(tool_name, args):
+        return "contents"
+
+    async def bad_call(tool_name, args):
+        raise ValueError("boom")
+
+    hook = wrapper.make_process_tool_call("filesystem", spec=spec)
+
+    async def run():
+        await hook(FakeCtx(), ok_call, "read_text_file", {"path": "/sandbox/notes.txt"})
+        with pytest.raises(PermissionError):
+            await hook(FakeCtx(), MagicMock(), "unlisted_tool", {})
+        with pytest.raises(ValueError):
+            await hook(FakeCtx(), bad_call, "read_text_file", {"path": "/sandbox/notes.txt"})
+
+    asyncio.run(run())
+
+    records = [json.loads(line) for line in temp_log.read_text().splitlines()]
+    assert [r["status"] for r in records] == ["ok", "denied", "error"]
+    assert [r.get("spec_hash") for r in records] == ["deadbeef1234"] * 3
+
+
+def test_phase1_record_carries_no_spec_hash(temp_log):
+    """No spec, no hash. An absent policy must not be reported as a policy."""
+    async def fake_call_tool(tool_name, args):
+        return {"ok": True}
+
+    hook = wrapper.make_process_tool_call("filesystem")  # Phase 1, no spec
+
+    async def run():
+        return await hook(FakeCtx(), fake_call_tool, "any_tool", {"x": "y"})
+
+    asyncio.run(run())
+
+    records = [json.loads(line) for line in temp_log.read_text().splitlines()]
+    assert len(records) == 1
+    assert "spec_hash" not in records[0]
+
+
 # ---------------------------------------------------------------------------
 # Correlation IDs (Week 5 Stream 3)
 # ---------------------------------------------------------------------------
