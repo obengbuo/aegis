@@ -1,5 +1,11 @@
 # Secrets
+# .env.* as well as .env: a .env.local, or a .env.bak-<timestamp> left by an
+# editor or a script, is the same credential under a name the first line does
+# not match. One such file was found untracked and unignored in a sibling
+# repository during the pre-publication sweep.
 .env
+.env.*
+!.env.example
 
 # Python
 .venv/
