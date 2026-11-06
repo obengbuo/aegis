@@ -11,7 +11,7 @@ from aegis.policy import AegisApprovalRequired, CapabilitySpec, SpecValidationEr
 from aegis.proposer import propose_spec
 from aegis.wrapper import wrap_toolset
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "wrap_toolset",

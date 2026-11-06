@@ -3,7 +3,7 @@
 ## Install
 
 ```bash
-pip install git+https://github.com/obengbuo/aegis.git@v0.2.0
+pip install git+https://github.com/obengbuo/aegis.git@v0.2.1
 ```
 
 ## Complete runnable example (start here if you don't yet have a Pydantic AI agent)
@@ -354,7 +354,7 @@ you're in a different Python environment than the one you installed into.
 - Check which Python you're using: `python -c "import sys; print(sys.executable)"`
 - Make sure your virtual environment is activated. On Windows PowerShell:
   `.venv\Scripts\Activate.ps1`. On Unix: `source .venv/bin/activate`.
-- Reinstall in the current environment: `pip install --force-reinstall git+https://github.com/obengbuo/aegis.git@v0.2.0`
+- Reinstall in the current environment: `pip install --force-reinstall git+https://github.com/obengbuo/aegis.git@v0.2.1`
 
 ### `Could not resolve authentication method` when calling `propose_spec()`
 

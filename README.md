@@ -8,14 +8,14 @@ capability specs, enforces those specs at the tool-call layer with no LLM
 in the enforcement path, and produces a forensic audit trail for every
 decision.
 
-**Status:** v0.2.0 — pre-production, public, and installable.
+**Status:** v0.2.1 — pre-production, public, and installable.
 
 ---
 
 ## Install
 
 \`\`\`bash
-pip install git+https://github.com/obengbuo/aegis.git@v0.2.0
+pip install git+https://github.com/obengbuo/aegis.git@v0.2.1
 \`\`\`
 
 Requires Python 3.10+.

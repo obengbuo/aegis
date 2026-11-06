@@ -19,7 +19,7 @@ Status values used below:
 | **Partial** | Aegis addresses part of the category; the rest needs another control |
 | **Not covered** | Outside the layer Aegis operates at |
 
-Version: v0.2.0. Taxonomy version: 2025 (working draft).
+Version: v0.2.1. Taxonomy version: 2025 (working draft).
 
 ---
 
