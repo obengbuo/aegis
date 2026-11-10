@@ -1,11 +1,16 @@
 """
 tests/test_import_graph.py — pins the lazy import seams at module load.
 
-Two aegis modules are reached only through function-local imports:
+Three dependencies are reached only through function-local imports:
 
   * aegis.shipper — imported inside aegis.audit.write_record and inside
     AegisConfig.__post_init__, never at module level.
   * opentelemetry — imported inside aegis.audit._get_or_create_tracer.
+  * anthropic — imported inside aegis.proposer._anthropic(), on the first
+    propose_spec() call or the first access to aegis.proposer.anthropic.
+    anthropic 2.x imports opentelemetry as a side effect of being imported,
+    so a module-level `import anthropic` silently breaks the opentelemetry
+    seam above as well.
 
 Those function-local imports are what keep config.py's "no runtime imports
 from other aegis.* modules" property true, keep `import aegis` cheap for
@@ -30,9 +35,13 @@ from __future__ import annotations
 import ast
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
+
+from aegis import audit, proposer
+from aegis.policy import SpecValidationError
 
 _AEGIS = Path(__file__).resolve().parent.parent / "aegis"
 
@@ -119,6 +128,81 @@ def test_import_aegis_does_not_pull_in_shipper_or_opentelemetry():
         "if m in sys.modules)) or 'none')"
     )
     assert out == "none", f"`import aegis` eagerly imported: {out}"
+
+
+def test_import_aegis_does_not_import_anthropic():
+    """`import aegis` must not import the Anthropic SDK.
+
+    The proposer is the only consumer of anthropic and is not in the
+    enforcement path, so a caller who never proposes a spec must not pay for
+    the SDK — nor for what the SDK drags in. anthropic 2.x imports
+    opentelemetry when it is imported, so a module-level `import anthropic`
+    in aegis/proposer.py is exactly what broke the opentelemetry seam above
+    on a fresh install (aegis pins only anthropic>=0.40.0).
+
+    Asserted directly on anthropic rather than only via opentelemetry, so the
+    seam stays pinned whatever a future anthropic release does or doesn't
+    import. Any anthropic.* submodule implies the top-level package, so
+    checking that one name is sufficient.
+    """
+    out = _run(
+        "import aegis, sys; "
+        "print('anthropic' if 'anthropic' in sys.modules else 'none')"
+    )
+    assert out == "none", f"`import aegis` eagerly imported: {out}"
+
+
+def test_proposer_anthropic_attribute_resolves_lazily_to_the_real_module():
+    """aegis.proposer.anthropic stays a working attribute: absent from
+    sys.modules after import, then the real SDK module on first access.
+
+    Existing offline tests rely on it (monkeypatch.setattr(proposer.anthropic,
+    "Anthropic", ...) in test_public_api.py and test_shipper.py), so making the
+    import lazy must not make the attribute disappear.
+    """
+    out = _run(
+        "import sys\n"
+        "import aegis.proposer as p\n"
+        "assert 'anthropic' not in sys.modules, 'anthropic imported at load time'\n"
+        "mod = p.anthropic\n"
+        "assert mod is sys.modules['anthropic'], 'attribute is not the real SDK module'\n"
+        "assert p.anthropic is mod, 'second access returned a different object'\n"
+        "print('lazy')\n"
+    )
+    assert out.endswith("lazy")
+
+
+def test_propose_spec_uses_a_patched_module_level_anthropic(tmp_path, monkeypatch):
+    """Replacing aegis.proposer.anthropic wholesale is honoured at call time.
+
+    Guards against the naive fix — a bare `import anthropic` inside
+    propose_spec — which would bind a local name and silently bypass any
+    test double installed on the module. Offline: no SDK client is built.
+    """
+    monkeypatch.setattr(audit, "LOG_PATH", tmp_path / "audit.jsonl")
+
+    calls: list[dict] = []
+
+    class _Block:
+        type = "tool_use"
+        name = "request_clarification"
+        input = {"question": "which file?"}
+
+    class _Messages:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return types.SimpleNamespace(content=[_Block()])
+
+    class _Client:
+        messages = _Messages()
+
+    fake_sdk = types.SimpleNamespace(Anthropic=lambda *a, **k: _Client())
+    monkeypatch.setattr(proposer, "anthropic", fake_sdk)
+
+    with pytest.raises(SpecValidationError, match="proposer requested clarification"):
+        proposer.propose_spec("read the file", tmp_path)
+
+    assert len(calls) == 1, "propose_spec did not go through the patched module"
 
 
 def test_config_construction_resolves_the_lazy_shipper_import():
