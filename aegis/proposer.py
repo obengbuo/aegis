@@ -9,6 +9,13 @@ Trust boundary (enforced structurally, not just by prompt):
   - sandbox_root flows ONLY into the system-role message (with the prompt).
   - Nothing from user_request is allowed to reach the system message or the
     tool schemas. This is verifiable: see how system and messages are built.
+
+The Anthropic SDK is imported lazily — on the first propose_spec() call, or
+the first access to aegis.proposer.anthropic — never at module load. This
+module is imported by aegis/__init__.py, so a module-level `import anthropic`
+made every `import aegis` load the SDK, and anthropic 2.x imports
+opentelemetry when it is imported, which breaks audit.py's lazy OTLP seam.
+Pinned by tests/test_import_graph.py.
 """
 
 from __future__ import annotations
@@ -17,8 +24,8 @@ import hashlib
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-import anthropic
 import yaml
 from dotenv import load_dotenv
 from pydantic import ValidationError
@@ -26,6 +33,9 @@ from pydantic import ValidationError
 from aegis.audit import write_record
 from aegis.policy import CapabilitySpec, SpecValidationError
 from aegis.proposer_prompts import PROPOSER_PROMPT_HASH, SYSTEM_PROMPT
+
+if TYPE_CHECKING:
+    import anthropic
 
 # Idempotent: no-op if ANTHROPIC_API_KEY is already in the environment.
 # Makes the module self-contained so callers don't need to pre-load dotenv.
@@ -37,8 +47,36 @@ load_dotenv()
 # "claude-sonnet-4-6" (no dated suffix, unlike Haiku's "claude-haiku-4-5-20251001").
 _MODEL = "claude-sonnet-4-6"
 
+
+def _anthropic() -> Any:
+    """Return the Anthropic SDK module, importing it on first use.
+
+    Resolves through this module's globals so aegis.proposer.anthropic stays
+    patchable: a test double installed with
+    monkeypatch.setattr(proposer, "anthropic", fake) is what propose_spec
+    uses, and monkeypatch.setattr(proposer.anthropic, "Anthropic", fake)
+    patches the real module this returns. A bare `import anthropic` inside
+    propose_spec would bind a local name and bypass both.
+    """
+    module = globals().get("anthropic")
+    if module is None:
+        import anthropic as module
+
+        globals()["anthropic"] = module
+    return module
+
+
+def __getattr__(name: str) -> Any:
+    """PEP 562: resolve aegis.proposer.anthropic lazily on attribute access."""
+    if name == "anthropic":
+        return _anthropic()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # Tool schemas presented to the model. These are constants — nothing from
-# user_request or sandbox_root flows into them.
+# user_request or sandbox_root flows into them. The annotation is never
+# evaluated at runtime (from __future__ import annotations), so it does not
+# need the SDK imported.
 _TOOLS: list[anthropic.types.ToolParam] = [
     {
         "name": "emit_capability_spec",
@@ -120,7 +158,7 @@ def propose_spec(
         {"role": "user", "content": user_request},
     ]
 
-    client = anthropic.Anthropic()
+    client = _anthropic().Anthropic()
     response = client.messages.create(
         model=_MODEL,
         max_tokens=2048,
